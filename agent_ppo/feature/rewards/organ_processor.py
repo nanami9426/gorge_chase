@@ -37,26 +37,24 @@ class OrganProcessor:
         self.last_treasures_collected = None
         self.last_collected_buff = None
 
-    def process(self, env_info, organs, hero_pos):
-        """
-        1. 过滤出当前可拾取的物件，并补齐距离与方向信息；
-        2. 分别编码最近宝箱和最近buff的8维特征；
-        3. 根据当前最近目标与上一帧缓存，计算接近奖励和拾取奖励。
-        """
+    def calc_reward(self, env_info, organs, hero_pos):
+        available_organs = self.build_available_organs(organs, hero_pos)
+        organ_reward = self.calc_reward(env_info, available_organs)
+        return organ_reward
+    
+    def get_feats(self, organs, hero_pos):
         available_organs = self.build_available_organs(organs, hero_pos)
         nearest_treasure = self.select_nearest_organ(available_organs, sub_type=1)
         nearest_buff = self.select_nearest_organ(available_organs, sub_type=2)
-
-        # 特征固定编码为：最近宝箱 4 维 + 最近 buff 4 维。
+        # 特征固定编码为：最近宝箱 4 维 + 最近 buff 4 维
         organs_feat = np.concatenate(
             [
                 self.encode_organ_feat(nearest_treasure),
                 self.encode_organ_feat(nearest_buff),
             ]
         )
-        organ_reward = self.calc_reward(env_info, available_organs)
-        return organs_feat, organ_reward
-
+        return organs_feat
+    
     def direction_to_vector(self, direction_idx):
         return DIRECTION_TO_VECTOR.get(int(direction_idx), (0.0, 0.0))
 

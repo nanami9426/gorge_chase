@@ -9,10 +9,10 @@ Author: Tencent AI Arena Authors
 Feature preprocessor and reward design for Gorge Chase PPO.
 峡谷追猎 PPO 特征预处理与奖励设计。
 """
-
 import numpy as np
 
-from agent_ppo.feature.rewards import OrganProcessor # type: ignore
+from agent_ppo.feature.rewards import OrganProcessor
+from agent_ppo.feature.rewards import ExploreProcessor
 
 # Map size / 地图尺寸（128×128）
 MAP_SIZE = 128.0
@@ -38,6 +38,7 @@ def _norm(v, v_max, v_min=0.0):
 class Preprocessor:
     def __init__(self):
         self.organ_processor = OrganProcessor()
+        self.explore_processor = ExploreProcessor()
         self.reset()
 
     def reset(self):
@@ -45,11 +46,7 @@ class Preprocessor:
         self.max_step = 200
         self.last_min_monster_dist_norm = 0.5
         self.organ_processor.reset()
-
-        self.visited_grids = set() # 访问过的格子
-        self.grid_size = 8 # 地图128*128，把它切成16*16的格子，每格长8
-        self.last_hero_pos = None
-        self.stall_steps = 0
+        self.explore_processor.reset()
 
     def calc_monster_dist_reward(self, monster_feats) -> float:
         cur_min_dist_norm = 1.0
@@ -61,31 +58,6 @@ class Preprocessor:
         dist_shaping = 0.1 * (cur_min_dist_norm - self.last_min_monster_dist_norm)
         self.last_min_monster_dist_norm = cur_min_dist_norm
         return dist_shaping
-
-    def calc_explore_reward(self, hero_pos) -> float:
-        # 探索新的区域
-        grid_x = hero_pos["x"] // self.grid_size
-        grid_z = hero_pos["z"] // self.grid_size
-        grid = (grid_x, grid_z)
-        if grid not in self.visited_grids:
-            explore_reward = 0.02
-            self.visited_grids.add(grid)
-        else:
-            explore_reward = 0.0
-
-        # 防止原地逗留
-        cur_pos = (hero_pos["x"], hero_pos["z"])
-        if self.last_hero_pos is None:
-            moved = True
-        else:
-            moved = cur_pos != self.last_hero_pos
-        if moved:
-            self.stall_steps = 0
-        else:
-            self.stall_steps += 1
-        stall_penalty = -min(0.002 * self.stall_steps, 0.2)
-        self.last_hero_pos = cur_pos
-        return explore_reward + stall_penalty
 
     def feature_process(self, env_obs, last_action):
         """Process env_obs into feature vector, legal_action mask, and reward.
@@ -141,7 +113,7 @@ class Preprocessor:
 
         # OrganState[] 物件状态列表（宝箱、buff）
         organs = frame_state.get("organs", [])
-        organs_feat, organ_reward = self.organ_processor.process(env_info=env_info, organs=organs, hero_pos=hero_pos)
+        organs_feat = self.organ_processor.get_feats(organs=organs, hero_pos=hero_pos)
 
         # Local map features (16D) / 局部地图特征
         # 将局部信息转成1*16的向量
@@ -188,10 +160,11 @@ class Preprocessor:
 
         # Step reward / 即时奖励
         monster_dist_reward = self.calc_monster_dist_reward(monster_feats=monster_feats)
-        explore_reward = self.calc_explore_reward(hero_pos=hero_pos)
-
+        explore_reward = self.explore_processor.calc_reward(hero_pos=hero_pos)
+        organ_reward = self.organ_processor.calc_reward(env_info=env_info, organs=organs, hero_pos=hero_pos)
         # 每多活一步固定给奖励，后继考虑删了
         survive_reward = 0.0005
+        
         reward = [survive_reward + monster_dist_reward + explore_reward + organ_reward]
 
         return feature, legal_action, reward
