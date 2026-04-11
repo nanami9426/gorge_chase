@@ -13,6 +13,8 @@ import numpy as np
 
 from agent_ppo.feature.rewards import OrganProcessor
 from agent_ppo.feature.rewards import ExploreProcessor
+from agent_ppo.feature.rewards import FlashProcessor
+from agent_ppo.feature.rewards import MoveProcessor
 
 # Map size / 地图尺寸（128×128）
 MAP_SIZE = 128.0
@@ -55,6 +57,8 @@ class Preprocessor:
     def __init__(self):
         self.organ_processor = OrganProcessor()
         self.explore_processor = ExploreProcessor()
+        self.flash_processor = FlashProcessor()
+        self.move_processor = MoveProcessor()
         self.reset()
 
     def reset(self):
@@ -64,6 +68,8 @@ class Preprocessor:
         self.last_step_score = 0.0
         self.organ_processor.reset()
         self.explore_processor.reset()
+        self.flash_processor.reset()
+        self.move_processor.reset()
 
     def calc_progress_reward(self, env_info) -> float:
         step_score = float(env_info.get("step_score", 0.0))
@@ -85,6 +91,7 @@ class Preprocessor:
         return dist_shaping
 
     def feature_process(self, env_obs, last_action):
+        # last_action：0~7：移动 8~15：闪现
         """Process env_obs into feature vector, legal_action mask, and reward.
 
         将 env_obs 转换为特征向量、合法动作掩码和即时奖励。
@@ -160,10 +167,18 @@ class Preprocessor:
         if sum(legal_action) == 0:
             legal_action = [1] * 16
 
+        legal_action, move_mask = self.move_processor.mask_legal_action(
+            legal_action=legal_action,
+            map_info=map_info,
+        )
+        legal_action, danger_score = self.flash_processor.mask_legal_action(
+            legal_action=legal_action,
+            monster_feats=monster_feats,
+        )
+
         # Progress features (2D) / 进度特征
         step_norm = _norm(self.step_no, self.max_step)
-        survival_ratio = step_norm
-        progress_feat = np.array([step_norm, survival_ratio], dtype=np.float32)
+        progress_feat = np.array([step_norm, danger_score], dtype=np.float32)
 
         # Concatenate features / 拼接特征
         feature = np.concatenate(
@@ -183,7 +198,9 @@ class Preprocessor:
         explore_reward = self.explore_processor.calc_reward(hero_pos=hero_pos)
         organ_reward = self.organ_processor.calc_reward(env_info=env_info, organs=organs, hero_pos=hero_pos)
         progress_reward = self.calc_progress_reward(env_info=env_info)
-        
-        reward = [progress_reward + monster_dist_reward + explore_reward + organ_reward]
+        flash_reward = self.flash_processor.calc_reward(last_action=last_action, danger_score=danger_score)
+        move_reward = self.move_processor.calc_reward(last_action=last_action, move_mask=move_mask)
+
+        reward = [progress_reward + monster_dist_reward + explore_reward + organ_reward + flash_reward + move_reward]
 
         return feature, legal_action, reward

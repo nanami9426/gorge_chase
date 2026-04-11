@@ -1,4 +1,6 @@
 from agent_ppo.feature.rewards.organ_processor import OrganProcessor
 from agent_ppo.feature.rewards.explore_processor import ExploreProcessor
+from agent_ppo.feature.rewards.flash_processor import FlashProcessor
+from agent_ppo.feature.rewards.move_processor import MoveProcessor
 
-__all__ = ["OrganProcessor", "ExploreProcessor"]
+__all__ = ["OrganProcessor", "ExploreProcessor", "FlashProcessor", "MoveProcessor"]

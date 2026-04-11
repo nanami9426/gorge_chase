@@ -28,7 +28,7 @@ class Config:
     FEATURE_LEN = sum(FEATURE_SPLIT_SHAPE)
     DIM_OF_OBSERVATION = FEATURE_LEN
 
-    # Action space / 动作空间：8个移动方向
+    # Action space / 动作空间：16个移动方向
     ACTION_NUM = 16
 
     # Value head / 价值头：单头生存奖励

@@ -5,9 +5,13 @@ MAP_SIZE = 128.0
 MAX_DIST_BUCKET = 5.0
 MAX_MAP_DISTANCE = MAP_SIZE * 1.41
 TREASURE_APPROACH_REWARD_SCALE = 0.30
+TREASURE_NEAR_APPROACH_BONUS = 0.90
 BUFF_APPROACH_REWARD_SCALE = 0.10
 TREASURE_PICKUP_REWARD = 2.5
 BUFF_PICKUP_REWARD = 0.75
+TREASURE_NEAR_DIST_NORM = 6.0 / MAX_MAP_DISTANCE # 近距离宝箱的阈值，大约是6格以内
+TREASURE_STALL_PENALTY_SCALE = 0.02
+TREASURE_STALL_PENALTY_CAP = 0.20
 SQRT_HALF = float(np.sqrt(0.5))
 
 DIRECTION_TO_VECTOR = {
@@ -37,6 +41,7 @@ class OrganProcessor:
         self.last_buff_dist_norm = None
         self.last_treasures_collected = None
         self.last_collected_buff = None
+        self.treasure_stall_steps = 0
 
     def get_feats(self, organs, hero_pos):
         available_organs = self.build_available_organs(organs, hero_pos)
@@ -115,13 +120,24 @@ class OrganProcessor:
         nearest_treasure = self.select_nearest_organ(available_organs, sub_type=1)
         nearest_buff = self.select_nearest_organ(available_organs, sub_type=2)
 
-        # 接近奖励优先对宝箱生效，不再依赖同一帧锁定到完全相同的 config_id。
         approach_reward = 0.0
         if nearest_treasure is not None and self.last_treasure_dist_norm is not None:
-            approach_reward += TREASURE_APPROACH_REWARD_SCALE * (
-                self.last_treasure_dist_norm - nearest_treasure["dist_norm"]
+            # 判断这一帧是不是比上一帧更接近宝箱
+            close_ratio = max(
+                0.0,
+                (TREASURE_NEAR_DIST_NORM - nearest_treasure["dist_norm"]) / max(TREASURE_NEAR_DIST_NORM, 1e-6),
             )
+            treasure_scale = TREASURE_APPROACH_REWARD_SCALE + TREASURE_NEAR_APPROACH_BONUS * close_ratio
+            delta_dist = self.last_treasure_dist_norm - nearest_treasure["dist_norm"]
+            
+            if delta_dist > 0:
+                # 靠近宝箱时放大奖励
+                approach_reward += treasure_scale * delta_dist
+            else:
+                # 若为了绕墙暂时远离，只按基础系数处罚，避免负反馈过重
+                approach_reward += TREASURE_APPROACH_REWARD_SCALE * delta_dist
         elif nearest_buff is not None and self.last_buff_dist_norm is not None:
+            # 没宝箱就找buff
             approach_reward += BUFF_APPROACH_REWARD_SCALE * (
                 self.last_buff_dist_norm - nearest_buff["dist_norm"]
             )
@@ -139,9 +155,28 @@ class OrganProcessor:
 
         pickup_reward = treasure_gain * TREASURE_PICKUP_REWARD + buff_gain * BUFF_PICKUP_REWARD
 
+        # 已经非常接近宝箱却连续几步没有拿到，说明很可能在墙边抖动或绕不进去，给予额外惩罚
+        treasure_stall_penalty = 0.0
+        if nearest_treasure is not None and treasure_gain == 0:
+            is_near_treasure = nearest_treasure["dist_norm"] <= TREASURE_NEAR_DIST_NORM
+            not_getting_closer = (
+                self.last_treasure_dist_norm is not None
+                and nearest_treasure["dist_norm"] >= self.last_treasure_dist_norm - 1e-6
+            )
+            if is_near_treasure and not_getting_closer:
+                self.treasure_stall_steps += 1
+                treasure_stall_penalty = -min(
+                    TREASURE_STALL_PENALTY_SCALE * self.treasure_stall_steps,
+                    TREASURE_STALL_PENALTY_CAP,
+                )
+            else:
+                self.treasure_stall_steps = 0
+        else:
+            self.treasure_stall_steps = 0
+
         # 在奖励结算后刷新缓存
         self.last_treasure_dist_norm = None if nearest_treasure is None else nearest_treasure["dist_norm"]
         self.last_buff_dist_norm = None if nearest_buff is None else nearest_buff["dist_norm"]
         self.last_treasures_collected = treasures_collected
         self.last_collected_buff = collected_buff
-        return approach_reward + pickup_reward
+        return approach_reward + pickup_reward + treasure_stall_penalty
