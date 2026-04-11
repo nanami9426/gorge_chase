@@ -12,12 +12,14 @@ Feature preprocessor and reward design for Gorge Chase PPO.
 
 import numpy as np
 
+from agent_ppo.feature.rewards import OrganProcessor # type: ignore
+
 # Map size / 地图尺寸（128×128）
 MAP_SIZE = 128.0
 # Max monster speed / 最大怪物速度
 MAX_MONSTER_SPEED = 5.0
-# Max distance bucket / 距离桶最大值
-MAX_DIST_BUCKET = 5.0
+# Max map Euclidean distance / 地图欧氏距离上限
+MAX_MAP_DISTANCE = MAP_SIZE * 1.41
 # Max flash cooldown / 最大闪现冷却步数
 MAX_FLASH_CD = 2000.0
 # Max buff duration / buff最大持续时间
@@ -35,25 +37,26 @@ def _norm(v, v_max, v_min=0.0):
 
 class Preprocessor:
     def __init__(self):
+        self.organ_processor = OrganProcessor()
         self.reset()
 
     def reset(self):
         self.step_no = 0
         self.max_step = 200
         self.last_min_monster_dist_norm = 0.5
-        
-        
+        self.organ_processor.reset()
+
         self.visited_grids = set() # 访问过的格子
         self.grid_size = 8 # 地图128*128，把它切成16*16的格子，每格长8
         self.last_hero_pos = None
         self.stall_steps = 0
-        
+
     def calc_monster_dist_reward(self, monster_feats) -> float:
         cur_min_dist_norm = 1.0
         for m_feat in monster_feats:
             if m_feat[0] > 0:
                 cur_min_dist_norm = min(cur_min_dist_norm, m_feat[4])
-                
+
         # 远离最近的怪物，远离->正，接近->负
         dist_shaping = 0.1 * (cur_min_dist_norm - self.last_min_monster_dist_norm)
         self.last_min_monster_dist_norm = cur_min_dist_norm
@@ -69,7 +72,7 @@ class Preprocessor:
             self.visited_grids.add(grid)
         else:
             explore_reward = 0.0
-        
+
         # 防止原地逗留
         cur_pos = (hero_pos["x"], hero_pos["z"])
         if self.last_hero_pos is None:
@@ -81,9 +84,9 @@ class Preprocessor:
         else:
             self.stall_steps += 1
         stall_penalty = -min(0.002 * self.stall_steps, 0.2)
-        self.last_hero_pos = hero_pos
+        self.last_hero_pos = cur_pos
         return explore_reward + stall_penalty
-    
+
     def feature_process(self, env_obs, last_action):
         """Process env_obs into feature vector, legal_action mask, and reward.
 
@@ -124,7 +127,7 @@ class Preprocessor:
 
                     # Euclidean distance / 欧式距离
                     raw_dist = np.sqrt((hero_pos["x"] - m_pos["x"]) ** 2 + (hero_pos["z"] - m_pos["z"]) ** 2)
-                    dist_norm = _norm(raw_dist, MAP_SIZE * 1.41)
+                    dist_norm = _norm(raw_dist, MAX_MAP_DISTANCE)
                 else:
                     m_x_norm = 0.0
                     m_z_norm = 0.0
@@ -135,6 +138,10 @@ class Preprocessor:
                 )
             else:
                 monster_feats.append(np.zeros(5, dtype=np.float32))
+
+        # OrganState[] 物件状态列表（宝箱、buff）
+        organs = frame_state.get("organs", [])
+        organs_feat, organ_reward = self.organ_processor.process(env_info=env_info, organs=organs, hero_pos=hero_pos)
 
         # Local map features (16D) / 局部地图特征
         # 将局部信息转成1*16的向量
@@ -172,6 +179,7 @@ class Preprocessor:
                 hero_feat,
                 monster_feats[0],
                 monster_feats[1],
+                organs_feat,
                 map_feat,
                 np.array(legal_action, dtype=np.float32),
                 progress_feat,
@@ -181,9 +189,9 @@ class Preprocessor:
         # Step reward / 即时奖励
         monster_dist_reward = self.calc_monster_dist_reward(monster_feats=monster_feats)
         explore_reward = self.calc_explore_reward(hero_pos=hero_pos)
-        
+
         # 每多活一步固定给奖励，后继考虑删了
         survive_reward = 0.0005
-        reward = [survive_reward + monster_dist_reward + explore_reward]
+        reward = [survive_reward + monster_dist_reward + explore_reward + organ_reward]
 
         return feature, legal_action, reward

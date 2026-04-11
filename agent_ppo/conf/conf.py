@@ -18,10 +18,12 @@ class Config:
         4,
         5,
         5,
+        8,
         16,
         16,
         2,
     ]
+    
     FEATURE_SPLIT_SHAPE = FEATURES
     FEATURE_LEN = sum(FEATURE_SPLIT_SHAPE)
     DIM_OF_OBSERVATION = FEATURE_LEN
