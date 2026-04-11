@@ -4,9 +4,10 @@ import numpy as np
 MAP_SIZE = 128.0
 MAX_DIST_BUCKET = 5.0
 MAX_MAP_DISTANCE = MAP_SIZE * 1.41
-ORGAN_APPROACH_REWARD_SCALE = 0.08
-TREASURE_PICKUP_REWARD = 1.0
-BUFF_PICKUP_REWARD = 0.5
+TREASURE_APPROACH_REWARD_SCALE = 0.30
+BUFF_APPROACH_REWARD_SCALE = 0.10
+TREASURE_PICKUP_REWARD = 2.5
+BUFF_PICKUP_REWARD = 0.75
 SQRT_HALF = float(np.sqrt(0.5))
 
 DIRECTION_TO_VECTOR = {
@@ -32,8 +33,8 @@ class OrganProcessor:
         self.reset()
 
     def reset(self):
-        self.last_target_key = None
-        self.last_target_dist_norm = None
+        self.last_treasure_dist_norm = None
+        self.last_buff_dist_norm = None
         self.last_treasures_collected = None
         self.last_collected_buff = None
 
@@ -92,6 +93,13 @@ class OrganProcessor:
             return None
         return min(candidates, key=lambda organ: organ["dist_norm"])
 
+    def select_target_organ(self, organs):
+        # 训练时优先追宝箱，只有没有宝箱时才考虑 buff。
+        nearest_treasure = self.select_nearest_organ(organs, sub_type=1)
+        if nearest_treasure is not None:
+            return nearest_treasure
+        return self.select_nearest_organ(organs, sub_type=2)
+
     def encode_organ_feat(self, organ_info):
         # 如果当前类型没有可拾取目标，则返回全零
         if organ_info is None:
@@ -104,16 +112,18 @@ class OrganProcessor:
         
     def calc_reward(self, env_info, organs, hero_pos) -> float:
         available_organs = self.build_available_organs(organs, hero_pos)
-        current_target = self.select_nearest_organ(available_organs)
-        # 接近奖励，仅当当前主目标和上一帧主目标是同一个实体时，才按距离差值发奖励。
+        nearest_treasure = self.select_nearest_organ(available_organs, sub_type=1)
+        nearest_buff = self.select_nearest_organ(available_organs, sub_type=2)
+
+        # 接近奖励优先对宝箱生效，不再依赖同一帧锁定到完全相同的 config_id。
         approach_reward = 0.0
-        if (
-            current_target is not None
-            and self.last_target_key == current_target["key"]
-            and self.last_target_dist_norm is not None
-        ):
-            approach_reward = ORGAN_APPROACH_REWARD_SCALE * (
-                self.last_target_dist_norm - current_target["dist_norm"]
+        if nearest_treasure is not None and self.last_treasure_dist_norm is not None:
+            approach_reward += TREASURE_APPROACH_REWARD_SCALE * (
+                self.last_treasure_dist_norm - nearest_treasure["dist_norm"]
+            )
+        elif nearest_buff is not None and self.last_buff_dist_norm is not None:
+            approach_reward += BUFF_APPROACH_REWARD_SCALE * (
+                self.last_buff_dist_norm - nearest_buff["dist_norm"]
             )
 
         # 拾取奖励，通过 treasures_collected 和 collected_buff 判断本帧是否真的完成了拾取
@@ -130,13 +140,8 @@ class OrganProcessor:
         pickup_reward = treasure_gain * TREASURE_PICKUP_REWARD + buff_gain * BUFF_PICKUP_REWARD
 
         # 在奖励结算后刷新缓存
-        if current_target is None:
-            self.last_target_key = None
-            self.last_target_dist_norm = None
-        else:
-            self.last_target_key = current_target["key"]
-            self.last_target_dist_norm = current_target["dist_norm"]
-
+        self.last_treasure_dist_norm = None if nearest_treasure is None else nearest_treasure["dist_norm"]
+        self.last_buff_dist_norm = None if nearest_buff is None else nearest_buff["dist_norm"]
         self.last_treasures_collected = treasures_collected
         self.last_collected_buff = collected_buff
         return approach_reward + pickup_reward

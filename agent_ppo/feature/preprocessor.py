@@ -20,10 +20,26 @@ MAP_SIZE = 128.0
 MAX_MONSTER_SPEED = 5.0
 # Max map Euclidean distance / 地图欧氏距离上限
 MAX_MAP_DISTANCE = MAP_SIZE * 1.41
+# Max monster distance bucket / 怪物距离桶上限
+MAX_MONSTER_DIST_BUCKET = 5.0
 # Max flash cooldown / 最大闪现冷却步数
 MAX_FLASH_CD = 2000.0
 # Max buff duration / buff最大持续时间
 MAX_BUFF_DURATION = 50.0
+STEP_SCORE_REWARD_SCALE = 0.003
+SQRT_HALF = float(np.sqrt(0.5))
+
+DIR_TO_VEC = {
+    0: (0.0, 0.0),
+    1: (1.0, 0.0),
+    2: (SQRT_HALF, SQRT_HALF),
+    3: (0.0, 1.0),
+    4: (-SQRT_HALF, SQRT_HALF),
+    5: (-1.0, 0.0),
+    6: (-SQRT_HALF, -SQRT_HALF),
+    7: (0.0, -1.0),
+    8: (SQRT_HALF, -SQRT_HALF),
+}
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -45,14 +61,23 @@ class Preprocessor:
         self.step_no = 0
         self.max_step = 200
         self.last_min_monster_dist_norm = 0.5
+        self.last_step_score = 0.0
         self.organ_processor.reset()
         self.explore_processor.reset()
+
+    def calc_progress_reward(self, env_info) -> float:
+        step_score = float(env_info.get("step_score", 0.0))
+        step_score_gain = max(0.0, step_score - self.last_step_score)
+        self.last_step_score = step_score
+        return STEP_SCORE_REWARD_SCALE * step_score_gain
+
+    def direction_to_vector(self, direction_idx):
+        return DIR_TO_VEC.get(int(direction_idx), (0.0, 0.0))
 
     def calc_monster_dist_reward(self, monster_feats) -> float:
         cur_min_dist_norm = 1.0
         for m_feat in monster_feats:
-            if m_feat[0] > 0:
-                cur_min_dist_norm = min(cur_min_dist_norm, m_feat[4])
+            cur_min_dist_norm = min(cur_min_dist_norm, float(m_feat[4]))
 
         # 远离最近的怪物，远离->正，接近->负
         dist_shaping = 0.1 * (cur_min_dist_norm - self.last_min_monster_dist_norm)
@@ -91,25 +116,20 @@ class Preprocessor:
             if i < len(monsters):
                 m = monsters[i]
                 is_in_view = float(m.get("is_in_view", 0))
-                m_pos = m["pos"]
-                if is_in_view:
-                    m_x_norm = _norm(m_pos["x"], MAP_SIZE)
-                    m_z_norm = _norm(m_pos["z"], MAP_SIZE)
-                    m_speed_norm = _norm(m.get("speed", 1), MAX_MONSTER_SPEED)
-
-                    # Euclidean distance / 欧式距离
+                dir_x, dir_z = self.direction_to_vector(m.get("hero_relative_direction", 0))
+                m_speed_norm = _norm(m.get("speed", 1), MAX_MONSTER_SPEED)
+                m_pos = m.get("pos", {})
+                if is_in_view and isinstance(m_pos, dict) and "x" in m_pos and "z" in m_pos:
+                    # In-view monsters use exact distance, direction still uses relative encoding.
                     raw_dist = np.sqrt((hero_pos["x"] - m_pos["x"]) ** 2 + (hero_pos["z"] - m_pos["z"]) ** 2)
                     dist_norm = _norm(raw_dist, MAX_MAP_DISTANCE)
                 else:
-                    m_x_norm = 0.0
-                    m_z_norm = 0.0
-                    m_speed_norm = 0.0
-                    dist_norm = 1.0
+                    dist_norm = _norm(m.get("hero_l2_distance", MAX_MONSTER_DIST_BUCKET), MAX_MONSTER_DIST_BUCKET)
                 monster_feats.append(
-                    np.array([is_in_view, m_x_norm, m_z_norm, m_speed_norm, dist_norm], dtype=np.float32)
+                    np.array([is_in_view, dir_x, dir_z, m_speed_norm, dist_norm], dtype=np.float32)
                 )
             else:
-                monster_feats.append(np.zeros(5, dtype=np.float32))
+                monster_feats.append(np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32))
 
         # OrganState[] 物件状态列表（宝箱、buff）
         organs = frame_state.get("organs", [])
@@ -162,9 +182,8 @@ class Preprocessor:
         monster_dist_reward = self.calc_monster_dist_reward(monster_feats=monster_feats)
         explore_reward = self.explore_processor.calc_reward(hero_pos=hero_pos)
         organ_reward = self.organ_processor.calc_reward(env_info=env_info, organs=organs, hero_pos=hero_pos)
-        # 每多活一步固定给奖励，后继考虑删了
-        survive_reward = 0.0005
+        progress_reward = self.calc_progress_reward(env_info=env_info)
         
-        reward = [survive_reward + monster_dist_reward + explore_reward + organ_reward]
+        reward = [progress_reward + monster_dist_reward + explore_reward + organ_reward]
 
         return feature, legal_action, reward
