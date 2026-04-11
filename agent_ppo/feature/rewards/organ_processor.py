@@ -37,11 +37,6 @@ class OrganProcessor:
         self.last_treasures_collected = None
         self.last_collected_buff = None
 
-    def calc_reward(self, env_info, organs, hero_pos):
-        available_organs = self.build_available_organs(organs, hero_pos)
-        organ_reward = self.calc_reward(env_info, available_organs)
-        return organ_reward
-    
     def get_feats(self, organs, hero_pos):
         available_organs = self.build_available_organs(organs, hero_pos)
         nearest_treasure = self.select_nearest_organ(available_organs, sub_type=1)
@@ -106,8 +101,9 @@ class OrganProcessor:
             [1.0, organ_info["dist_norm"], organ_info["dir_x"], organ_info["dir_z"]],
             dtype=np.float32,
         )
-
-    def calc_reward(self, env_info, available_organs) -> float:
+        
+    def calc_reward(self, env_info, organs, hero_pos) -> float:
+        available_organs = self.build_available_organs(organs, hero_pos)
         current_target = self.select_nearest_organ(available_organs)
         # 接近奖励，仅当当前主目标和上一帧主目标是同一个实体时，才按距离差值发奖励。
         approach_reward = 0.0
