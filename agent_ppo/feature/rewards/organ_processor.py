@@ -115,12 +115,13 @@ class OrganProcessor:
             dtype=np.float32,
         )
         
-    def calc_reward(self, env_info, organs, hero_pos) -> float:
+    def calc_reward(self, env_info, organs, hero_pos):
         available_organs = self.build_available_organs(organs, hero_pos)
         nearest_treasure = self.select_nearest_organ(available_organs, sub_type=1)
         nearest_buff = self.select_nearest_organ(available_organs, sub_type=2)
 
-        approach_reward = 0.0
+        treasure_reward = 0.0
+        buff_reward = 0.0
         if nearest_treasure is not None and self.last_treasure_dist_norm is not None:
             # 判断这一帧是不是比上一帧更接近宝箱
             close_ratio = max(
@@ -132,13 +133,13 @@ class OrganProcessor:
             
             if delta_dist > 0:
                 # 靠近宝箱时放大奖励
-                approach_reward += treasure_scale * delta_dist
+                treasure_reward += treasure_scale * delta_dist
             else:
                 # 若为了绕墙暂时远离，只按基础系数处罚，避免负反馈过重
-                approach_reward += TREASURE_APPROACH_REWARD_SCALE * delta_dist
+                treasure_reward += TREASURE_APPROACH_REWARD_SCALE * delta_dist
         elif nearest_buff is not None and self.last_buff_dist_norm is not None:
             # 没宝箱就找buff
-            approach_reward += BUFF_APPROACH_REWARD_SCALE * (
+            buff_reward += BUFF_APPROACH_REWARD_SCALE * (
                 self.last_buff_dist_norm - nearest_buff["dist_norm"]
             )
 
@@ -153,7 +154,8 @@ class OrganProcessor:
         if self.last_collected_buff is not None:
             buff_gain = max(0, collected_buff - self.last_collected_buff)
 
-        pickup_reward = treasure_gain * TREASURE_PICKUP_REWARD + buff_gain * BUFF_PICKUP_REWARD
+        treasure_reward += treasure_gain * TREASURE_PICKUP_REWARD
+        buff_reward += buff_gain * BUFF_PICKUP_REWARD
 
         # 已经非常接近宝箱却连续几步没有拿到，说明很可能在墙边抖动或绕不进去，给予额外惩罚
         treasure_stall_penalty = 0.0
@@ -179,4 +181,8 @@ class OrganProcessor:
         self.last_buff_dist_norm = None if nearest_buff is None else nearest_buff["dist_norm"]
         self.last_treasures_collected = treasures_collected
         self.last_collected_buff = collected_buff
-        return approach_reward + pickup_reward + treasure_stall_penalty
+        return {
+            "treasure_reward": float(treasure_reward),
+            "buff_reward": float(buff_reward),
+            "treasure_stall_penalty": float(treasure_stall_penalty),
+        }

@@ -12,6 +12,7 @@ Training workflow for Gorge Chase PPO.
 
 import os
 import time
+from collections import defaultdict
 
 import numpy as np
 from agent_ppo.feature.definition import SampleData, sample_process
@@ -20,6 +21,11 @@ from tools.train_env_conf_validate import read_usr_conf
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 
 MODEL_SAVE_INTERVAL = 60 * 10
+PHASE_LOG_ORDER = [
+    "phase_0_loot",
+    "phase_1_double_monster",
+    "phase_2_speedup_survival",
+]
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     last_save_model_time = time.time()
@@ -95,6 +101,9 @@ class EpisodeRunner:
             done = False
             step = 0
             total_reward = 0.0
+            terminal_phase = "unknown"
+            phase_step_counts = defaultdict(int)
+            reward_breakdown_sum = defaultdict(float)
 
             self.logger.info(f"Episode {self.episode_cnt} start")
 
@@ -124,6 +133,11 @@ class EpisodeRunner:
                 # Step reward / 每步即时奖励
                 reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
                 total_reward += float(reward[0])
+                terminal_phase = _remain_info.get("phase_name", terminal_phase)
+                phase_step_counts[terminal_phase] += 1
+                weighted_breakdown = _remain_info.get("reward_breakdown", {}).get("weighted", {})
+                for key, value in weighted_breakdown.items():
+                    reward_breakdown_sum[key] += float(value)
 
                 # Terminal reward / 终局奖励
                 final_reward = np.zeros(1, dtype=np.float32)
@@ -144,7 +158,19 @@ class EpisodeRunner:
                         f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
                         f"result:{result_str} sim_score:{total_score:.1f} "
                         f"treasures:{treasures_collected} buffs:{collected_buff} "
-                        f"total_reward:{total_reward:.3f}"
+                        f"total_reward:{total_reward:.3f} terminal_phase:{terminal_phase}"
+                    )
+                    phase_step_counts_log = {
+                        phase_name: phase_step_counts.get(phase_name, 0) for phase_name in PHASE_LOG_ORDER
+                    }
+                    reward_breakdown_mean = {
+                        key: round(value / max(step, 1), 4)
+                        for key, value in sorted(reward_breakdown_sum.items())
+                    }
+                    self.logger.info(
+                        f"[PHASE] episode:{self.episode_cnt} terminal_phase:{terminal_phase} "
+                        f"phase_step_counts:{phase_step_counts_log} "
+                        f"reward_breakdown_mean:{reward_breakdown_mean}"
                     )
 
                 # Build sample frame / 构造样本帧

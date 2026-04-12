@@ -56,12 +56,11 @@ class Agent(BaseAgent):
 
         将原始观测转换为 ObsData 和 remain_info。
         """
-        feature, legal_action, reward = self.preprocessor.feature_process(env_obs, self.last_action)
+        feature, legal_action, remain_info = self.preprocessor.feature_process(env_obs, self.last_action)
         obs_data = ObsData(
             feature=list(feature),
             legal_action=legal_action,
         )
-        remain_info = {"reward": reward}
         return obs_data, remain_info
 
     def predict(self, list_obs_data):
@@ -118,8 +117,19 @@ class Agent(BaseAgent):
         加载模型检查点。
         """
         model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
-        self.model.load_state_dict(torch.load(model_file_path, map_location=self.device))
-        self.logger.info(f"load model {model_file_path} successfully")
+        try:
+            state_dict = torch.load(model_file_path, map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            if self.logger:
+                self.logger.info(f"load model {model_file_path} successfully")
+        except FileNotFoundError:
+            if self.logger:
+                self.logger.warning(f"model file {model_file_path} not found, keep current weights")
+        except RuntimeError as exc:
+            if self.logger:
+                self.logger.warning(
+                    f"skip incompatible model {model_file_path}, keep current weights: {exc}"
+                )
 
     def action_process(self, act_data, is_stochastic=True):
         """Unpack ActData to int action and update last_action.

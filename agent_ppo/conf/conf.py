@@ -20,9 +20,10 @@ class Config:
         5,
         8,
         16,
-        3,
+        11,
         16,
         2,
+        5,
     ]
     
     FEATURE_SPLIT_SHAPE = FEATURES
