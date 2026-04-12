@@ -19,6 +19,7 @@ class FlashProcessor:
         self.last_danger_score = 0.0
 
     def get_nearest_monster_feat(self, monster_feats):
+        # 直接取最近怪物的整条特征，供多个逻辑复用
         if not monster_feats:
             return None
         return min(monster_feats, key=lambda feat: float(feat[4]))
@@ -45,6 +46,7 @@ class FlashProcessor:
         return float(np.clip(danger_score, 0.0, 1.0))
 
     def calc_danger_score(self, monster_feats, wall_pressure=0.0, corner_pressure=0.0) -> float:
+        # 在基础怪物危险度上叠加“贴墙/死角”困境，避免等到贴脸才开始逃
         base_danger = self.calc_base_danger_score(monster_feats)
         danger_score = base_danger + 0.15 * float(wall_pressure) + 0.10 * float(corner_pressure)
         return float(np.clip(danger_score, 0.0, 1.0))
@@ -69,8 +71,8 @@ class FlashProcessor:
 
         if (
             last_action is not None
-            and FLASH_ACTION_START <= int(last_action) < FLASH_ACTION_END
-            and prev_danger_score < FLASH_DANGER_THRESHOLD
+            and FLASH_ACTION_START <= int(last_action) < FLASH_ACTION_END  # 上一帧使用闪现
+            and prev_danger_score < FLASH_DANGER_THRESHOLD # 上一帧不危险
         ):
             # 如果上一帧不危险却使用了闪现，就给惩罚
             safe_margin = FLASH_DANGER_THRESHOLD - prev_danger_score
