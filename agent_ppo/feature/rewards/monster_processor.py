@@ -5,19 +5,9 @@ MAP_SIZE = 128.0
 MAX_MAP_DISTANCE = MAP_SIZE * 1.41
 MAX_MONSTER_SPEED = 5.0
 MAX_MONSTER_DIST_BUCKET = 5.0
-MAX_MONSTER_COUNT = 2.0
 MONSTER_FEATURE_COUNT = 2
 MONSTER_DIST_REWARD_SCALE = 0.1
 SQRT_HALF = float(np.sqrt(0.5))
-
-PHASE_LOOT = 0
-PHASE_DOUBLE_MONSTER = 1
-PHASE_SPEEDUP_SURVIVAL = 2
-PHASE_NAME_BY_ID = {
-    PHASE_LOOT: "phase_0_loot",
-    PHASE_DOUBLE_MONSTER: "phase_1_double_monster",
-    PHASE_SPEEDUP_SURVIVAL: "phase_2_speedup_survival",
-}
 
 DIR_TO_VEC = {
     0: (0.0, 0.0),
@@ -38,7 +28,7 @@ def _norm(v, v_max, v_min=0.0):
 
 
 class MonsterProcessor:
-    """怪物特征、阶段识别和怪物距离 shaping 处理器。"""
+    """怪物特征和怪物距离 shaping 处理器。"""
 
     def __init__(self):
         self.reset()
@@ -48,37 +38,6 @@ class MonsterProcessor:
 
     def direction_to_vector(self, direction_idx):
         return DIR_TO_VEC.get(int(direction_idx), (0.0, 0.0))
-
-    def get_phase_info(self, monsters):
-        # 按真实事件切阶段：先看怪物是否加速，再看第二只怪是否出现
-        monster_count = min(len(monsters), int(MAX_MONSTER_COUNT))
-        max_monster_speed = max((int(m.get("speed", 1)) for m in monsters), default=1)
-
-        if max_monster_speed > 1:
-            phase_id = PHASE_SPEEDUP_SURVIVAL
-        elif monster_count >= 2:
-            phase_id = PHASE_DOUBLE_MONSTER
-        else:
-            phase_id = PHASE_LOOT
-
-        return phase_id, PHASE_NAME_BY_ID[phase_id], monster_count, max_monster_speed
-
-    def get_phase_feat(self, phase_id, monster_count, max_monster_speed):
-        # 3维阶段 one-hot + 怪物数量/速度归一化
-        phase_onehot = np.zeros(3, dtype=np.float32)
-        phase_onehot[int(phase_id)] = 1.0
-        return np.concatenate(
-            [
-                phase_onehot,
-                np.array(
-                    [
-                        _norm(monster_count, MAX_MONSTER_COUNT, 1.0),
-                        _norm(max_monster_speed, MAX_MONSTER_SPEED, 1.0),
-                    ],
-                    dtype=np.float32,
-                ),
-            ]
-        )
 
     def get_feats(self, monsters, hero_pos):
         # Monster features (5D x 2) / 怪物特征

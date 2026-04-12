@@ -16,6 +16,7 @@ from agent_ppo.feature.rewards import ExploreProcessor
 from agent_ppo.feature.rewards import FlashProcessor
 from agent_ppo.feature.rewards import MonsterProcessor
 from agent_ppo.feature.rewards import MoveProcessor
+from agent_ppo.feature.rewards import PhaseProcessor
 from agent_ppo.feature.rewards import TerrainProcessor
 
 # Map size / 地图尺寸（128×128）
@@ -26,42 +27,6 @@ MAX_FLASH_CD = 2000.0
 MAX_BUFF_DURATION = 50.0
 STEP_SCORE_REWARD_SCALE = 0.003
 
-PHASE_REWARD_WEIGHTS = {
-    "phase_0_loot": {
-        "progress_reward": 1.00,
-        "monster_dist_reward": 0.80,
-        "explore_reward": 1.00,
-        "treasure_reward": 1.00,
-        "buff_reward": 0.85,
-        "treasure_stall_penalty": 1.00,
-        "terrain_reward": 0.90,
-        "flash_reward": 0.90,
-        "move_reward": 1.00,
-    },
-    "phase_1_double_monster": {
-        "progress_reward": 1.10,
-        "monster_dist_reward": 1.50,
-        "explore_reward": 0.55,
-        "treasure_reward": 0.65,
-        "buff_reward": 0.90,
-        "treasure_stall_penalty": 1.15,
-        "terrain_reward": 1.30,
-        "flash_reward": 1.15,
-        "move_reward": 1.00,
-    },
-    "phase_2_speedup_survival": {
-        "progress_reward": 1.20,
-        "monster_dist_reward": 1.90,
-        "explore_reward": 0.20,
-        "treasure_reward": 0.35,
-        "buff_reward": 0.75,
-        "treasure_stall_penalty": 1.25,
-        "terrain_reward": 1.55,
-        "flash_reward": 1.30,
-        "move_reward": 1.00,
-    },
-}
-
 
 def _norm(v, v_max, v_min=0.0):
     """Normalize value to [0, 1].
@@ -70,16 +35,6 @@ def _norm(v, v_max, v_min=0.0):
     """
     v = float(np.clip(v, v_min, v_max))
     return (v - v_min) / (v_max - v_min) if (v_max - v_min) > 1e-6 else 0.0
-
-
-def get_phase_weights(phase_name):
-    """Get fixed reward weights for the current training phase.
-
-    获取当前训练阶段对应的固定奖励权重。
-    """
-    return dict(PHASE_REWARD_WEIGHTS[str(phase_name)])
-
-
 class Preprocessor:
     def __init__(self):
         self.organ_processor = OrganProcessor()
@@ -87,6 +42,7 @@ class Preprocessor:
         self.flash_processor = FlashProcessor()
         self.monster_processor = MonsterProcessor()
         self.move_processor = MoveProcessor()
+        self.phase_processor = PhaseProcessor()
         self.terrain_processor = TerrainProcessor()
         self.reset()
 
@@ -99,6 +55,7 @@ class Preprocessor:
         self.flash_processor.reset()
         self.monster_processor.reset()
         self.move_processor.reset()
+        self.phase_processor.reset()
         self.terrain_processor.reset()
 
     def calc_progress_reward(self, env_info) -> float:
@@ -134,9 +91,9 @@ class Preprocessor:
 
         # Monster features (5D x 2) / 怪物特征
         monsters = frame_state.get("monsters", [])
-        phase_id, phase_name, monster_count, max_monster_speed = self.monster_processor.get_phase_info(monsters)
+        phase_id, phase_name, monster_count, max_monster_speed = self.phase_processor.get_phase_info(monsters)
         monster_feats = self.monster_processor.get_feats(monsters=monsters, hero_pos=hero_pos)
-        phase_feat = self.monster_processor.get_phase_feat(
+        phase_feat = self.phase_processor.get_feats(
             phase_id=phase_id,
             monster_count=monster_count,
             max_monster_speed=max_monster_speed,
@@ -237,11 +194,10 @@ class Preprocessor:
             "flash_reward": float(flash_reward),
             "move_reward": float(move_reward),
         }
-        phase_weights = get_phase_weights(phase_name)
-        weighted_reward_breakdown = {
-            key: float(raw_reward_breakdown[key] * phase_weights[key]) for key in phase_weights
-        }
-        total_reward = float(sum(weighted_reward_breakdown.values()))
+        phase_weights, weighted_reward_breakdown, total_reward = self.phase_processor.weight_reward_breakdown(
+            raw_reward_breakdown=raw_reward_breakdown,
+            phase_name=phase_name,
+        )
 
         # remain_info 除了总奖励，还暴露阶段和奖励拆分，便于训练期诊断
         remain_info = {
