@@ -15,6 +15,7 @@ from agent_ppo.feature.rewards import OrganProcessor
 from agent_ppo.feature.rewards import ExploreProcessor
 from agent_ppo.feature.rewards import FlashProcessor
 from agent_ppo.feature.rewards import MoveProcessor
+from agent_ppo.feature.rewards import TerrainProcessor
 
 # Map size / 地图尺寸（128×128）
 MAP_SIZE = 128.0
@@ -59,6 +60,7 @@ class Preprocessor:
         self.explore_processor = ExploreProcessor()
         self.flash_processor = FlashProcessor()
         self.move_processor = MoveProcessor()
+        self.terrain_processor = TerrainProcessor()
         self.reset()
 
     def reset(self):
@@ -70,6 +72,7 @@ class Preprocessor:
         self.explore_processor.reset()
         self.flash_processor.reset()
         self.move_processor.reset()
+        self.terrain_processor.reset()
 
     def calc_progress_reward(self, env_info) -> float:
         step_score = float(env_info.get("step_score", 0.0))
@@ -175,6 +178,7 @@ class Preprocessor:
             legal_action=legal_action,
             monster_feats=monster_feats,
         )
+        terrain_feat = self.terrain_processor.get_feats(map_info=map_info, move_mask=move_mask)
 
         # Progress features (2D) / 进度特征
         step_norm = _norm(self.step_no, self.max_step)
@@ -188,6 +192,7 @@ class Preprocessor:
                 monster_feats[1],
                 organs_feat,
                 map_feat,
+                terrain_feat,
                 np.array(legal_action, dtype=np.float32),
                 progress_feat,
             ]
@@ -200,7 +205,21 @@ class Preprocessor:
         progress_reward = self.calc_progress_reward(env_info=env_info)
         flash_reward = self.flash_processor.calc_reward(last_action=last_action, danger_score=danger_score)
         move_reward = self.move_processor.calc_reward(last_action=last_action, move_mask=move_mask)
+        terrain_reward = self.terrain_processor.calc_reward(
+            hero_pos=hero_pos,
+            map_info=map_info,
+            move_mask=move_mask,
+            danger_score=danger_score,
+        )
 
-        reward = [progress_reward + monster_dist_reward + explore_reward + organ_reward + flash_reward + move_reward]
+        reward = [
+            progress_reward
+            + monster_dist_reward
+            + explore_reward
+            + organ_reward
+            + flash_reward
+            + move_reward
+            + terrain_reward
+        ]
 
         return feature, legal_action, reward
