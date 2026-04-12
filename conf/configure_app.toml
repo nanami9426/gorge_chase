@@ -2,11 +2,11 @@
 
 # Replay buffer configurations
 # 样本池容量
-replay_buffer_capacity = 10000
+replay_buffer_capacity = 4096
 
 # The ratio of the sample pool capacity that triggers training
 # 当样本池中的样本占总容量的比例达到该值时，启动训练
-preload_ratio = 1.0
+preload_ratio = 0.3
 
 # When new samples are added to the sample pool, the logic for removing old samples: reverb.selectors.Lifo, reverb.selectors.Fifo
 # 当新样本加入样本池时，旧样本的移除逻辑，可选项：reverb.selectors.Lifo, reverb.selectors.Fifo
@@ -34,13 +34,13 @@ reverb_sampler = "reverb.selectors.Uniform"
 # 参数reverb_samples_per_insert: 每插入1条样本允许采样的最大次数（仅SampleToInsertRatio模式生效）
 # reverb_error_buffer: Tolerance buffer for ratio constraint, similar to TCP sliding window (only for SampleToInsertRatio)
 # 参数reverb_error_buffer: 比例限制的弹性缓冲区间，类似TCP滑动窗口（仅SampleToInsertRatio模式生效）
-reverb_rate_limiter = "MinSize"
-reverb_samples_per_insert = 5
-reverb_error_buffer = 5
+reverb_rate_limiter = "SampleToInsertRatio"
+reverb_samples_per_insert = 1
+reverb_error_buffer = 20
 
 # Training batch size limit for Learner
 # Learner训练时样本批处理大小
-train_batch_size = 2048
+train_batch_size = 1024
 
 # Model dump frequency (steps)
 # 训练间隔多少步输出模型参数文件

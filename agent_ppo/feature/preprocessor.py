@@ -29,7 +29,9 @@ MAX_MONSTER_DIST_BUCKET = 5.0
 MAX_FLASH_CD = 2000.0
 # Max buff duration / buff最大持续时间
 MAX_BUFF_DURATION = 50.0
-STEP_SCORE_REWARD_SCALE = 0.003
+# Keep step-score shaping strong enough that "survive longer = score higher"
+# becomes a first-class objective during PPO training.
+STEP_SCORE_REWARD_SCALE = 0.01
 SQRT_HALF = float(np.sqrt(0.5))
 
 DIR_TO_VEC = {

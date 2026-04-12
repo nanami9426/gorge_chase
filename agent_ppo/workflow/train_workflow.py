@@ -20,6 +20,9 @@ from tools.train_env_conf_validate import read_usr_conf
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 
 MODEL_SAVE_INTERVAL = 60 * 10
+FAIL_BASE_PENALTY = 1.0
+FAIL_EARLY_DEATH_PENALTY = 3.0
+SUCCESS_SURVIVAL_REWARD = 2.0
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     last_save_model_time = time.time()
@@ -133,17 +136,27 @@ class EpisodeRunner:
                     treasures_collected = env_info.get("treasures_collected", 0)
                     collected_buff = env_info.get("collected_buff", 0)
 
+                    max_step = float(env_info.get("max_step", step if step > 0 else 1))
+                    survival_ratio = min(1.0, float(step) / max(max_step, 1.0))
+
                     if terminated:
-                        final_reward[0] = -3.0
+                        # Penalize early deaths more than late deaths so the policy
+                        # keeps optimizing for long survival and higher step score.
+                        final_reward[0] = -(
+                            FAIL_BASE_PENALTY
+                            + FAIL_EARLY_DEATH_PENALTY * (1.0 - survival_ratio)
+                        )
                         result_str = "FAIL"
                     else:
-                        final_reward[0] = 1.0
+                        final_reward[0] = SUCCESS_SURVIVAL_REWARD
                         result_str = "WIN"
 
                     self.logger.info(
                         f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
                         f"result:{result_str} sim_score:{total_score:.1f} "
                         f"treasures:{treasures_collected} buffs:{collected_buff} "
+                        f"survival_ratio:{survival_ratio:.3f} "
+                        f"final_reward:{float(final_reward[0]):.3f} "
                         f"total_reward:{total_reward:.3f}"
                     )
 
