@@ -10,6 +10,8 @@ Agent class for Gorge Chase PPO.
 峡谷追猎 PPO Agent 主类。
 """
 
+from collections import deque
+
 import torch
 
 torch.set_num_threads(1)
@@ -39,6 +41,7 @@ class Agent(BaseAgent):
         self.algorithm = Algorithm(self.model, self.optimizer, self.device, logger, monitor)
         self.preprocessor = Preprocessor()
         self.last_action = -1
+        self.feature_history = deque(maxlen=Config.TEMPORAL_WINDOW)
         self.logger = logger
         self.monitor = monitor
         super().__init__(agent_type, device, logger, monitor)
@@ -50,13 +53,15 @@ class Agent(BaseAgent):
         """
         self.preprocessor.reset()
         self.last_action = -1
+        self.feature_history.clear()
 
     def observation_process(self, env_obs):
         """Convert raw env_obs to ObsData and remain_info.
 
         将原始观测转换为 ObsData 和 remain_info。
         """
-        feature, legal_action, remain_info = self.preprocessor.feature_process(env_obs, self.last_action)
+        frame_feature, legal_action, remain_info = self.preprocessor.feature_process(env_obs, self.last_action)
+        feature = self._stack_temporal_feature(frame_feature)
         obs_data = ObsData(
             feature=list(feature),
             legal_action=legal_action,
@@ -159,6 +164,26 @@ class Agent(BaseAgent):
         prob = self._legal_soft_max(logits_np, legal_action_np)
 
         return logits_np, value_np, prob
+
+    def _stack_temporal_feature(self, frame_feature):
+        """Build a fixed-length temporal observation from recent frames.
+
+        用最近几帧单帧特征构造固定长度的时序观测。
+        """
+        frame_feature = np.asarray(frame_feature, dtype=np.float32)
+
+        if not self.feature_history:
+            for _ in range(Config.TEMPORAL_WINDOW):
+                self.feature_history.append(frame_feature.copy())
+        else:
+            self.feature_history.append(frame_feature.copy())
+
+        stacked_frames = list(self.feature_history)
+        if len(stacked_frames) < Config.TEMPORAL_WINDOW:
+            pad_frame = stacked_frames[0]
+            stacked_frames = [pad_frame.copy() for _ in range(Config.TEMPORAL_WINDOW - len(stacked_frames))] + stacked_frames
+
+        return np.concatenate(stacked_frames, axis=0).astype(np.float32, copy=False)
 
     def _legal_soft_max(self, input_hidden, legal_action):
         """Softmax with legal action masking (numpy).

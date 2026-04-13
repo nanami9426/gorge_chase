@@ -5,16 +5,17 @@ import numpy as np
 
 
 MAP_SIZE = 128
-EXPLORE_GRID_REWARD = 0.05
+EXPLORE_GRID_REWARD = 0.1
 FRONTIER_BONUS_SCALE = 0.015
-EXPLORE_STREAK_BONUS_SCALE = 0.005
-EXPLORE_STREAK_BONUS_CAP = 0.03
+EXPLORE_STREAK_BONUS_SCALE = 0.008
+EXPLORE_STREAK_BONUS_CAP = 0.05
 MOVE_REWARD_SCALE = 0.004
 MOVE_REWARD_CAP = 2.0
 REVISIT_GRID_PENALTY = -0.004
+NON_RECENT_REVISIT_REWARD = 0.02
 STALL_PENALTY_SCALE = 0.005
 STALL_PENALTY_CAP = 0.18
-RECENT_GRID_WINDOW = 16
+RECENT_GRID_WINDOW = 15
 VISIT_COUNT_NORM_CAP = 6.0
 NO_PROGRESS_NORM_CAP = 20.0
 
@@ -25,7 +26,7 @@ class ExploreProcessor:
 
     def reset(self):
         self.visited_grid_counts = {}
-        self.grid_size = 6
+        self.grid_size = 4
         self.max_grid_index = int((MAP_SIZE - 1) // self.grid_size)
         self.last_hero_pos = None
         self.stall_steps = 0
@@ -91,6 +92,18 @@ class ExploreProcessor:
             dtype=np.float32,
         )
 
+    def calc_revisit_adjustment(self, grid, explore_new_grid, visit_count_after):
+        if explore_new_grid:
+            return 0.0
+
+        if grid in self.recent_grids:
+            return REVISIT_GRID_PENALTY
+
+        # 非 recent 的旧格子给一个小额衰减奖励，鼓励合理回撤与绕怪，
+        # 但访问次数越多，奖励越低，避免来回刷同一批安全格子。
+        revisit_count = max(1.0, float(visit_count_after - 1))
+        return float(NON_RECENT_REVISIT_REWARD / math.sqrt(revisit_count))
+
     def calc_reward(self, hero_pos, step_no, danger_score):
         context = self.get_context(hero_pos)
         grid = context["grid"]
@@ -103,7 +116,11 @@ class ExploreProcessor:
             explore_reward = 0.0
             explore_streak_steps = 0
 
-        revisit_penalty = REVISIT_GRID_PENALTY if grid in self.recent_grids else 0.0
+        revisit_adjustment = self.calc_revisit_adjustment(
+            grid=grid,
+            explore_new_grid=explore_new_grid,
+            visit_count_after=context["visit_count_after"],
+        )
         cur_pos = (hero_pos["x"], hero_pos["z"])
         move_reward = 0.0
         if self.last_hero_pos is None:
@@ -138,7 +155,7 @@ class ExploreProcessor:
         self.last_hero_pos = cur_pos
         self.recent_grids.append(grid)
         return {
-            "reward": float(positive_reward + revisit_penalty + stall_penalty),
+            "reward": float(positive_reward + revisit_adjustment + stall_penalty),
             "explore_new_grid": int(explore_new_grid),
             "frontier_bonus": float(safe_explore_weight * frontier_bonus),
             "explore_streak_bonus": float(safe_explore_weight * explore_streak_bonus),

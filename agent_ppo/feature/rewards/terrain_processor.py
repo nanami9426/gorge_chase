@@ -39,8 +39,8 @@ WALL_FOLLOW_PRESSURE_THRESHOLD = 0.55
 WALL_FOLLOW_PENALTY_SCALE = 0.03
 
 # 贴墙停滞处罚参数
-WALL_STALL_PENALTY_SCALE = 0.02
-WALL_STALL_PENALTY_CAP = 0.20
+WALL_STALL_PENALTY_SCALE = 0.05
+WALL_STALL_PENALTY_CAP = 0.35
 
 MOVE_DIRS = [
     (0, 1),
@@ -309,13 +309,13 @@ class TerrainProcessor:
             # 一旦移动了，或者已经不算贴墙，就清空停滞计数
             self.wall_stall_steps = 0
         else:
-            # 贴墙停滞会在危险时继续加重，避免沿墙发呆直到怪物贴脸
+            # 贴墙停滞会在危险时继续加重，低危险时也要避免“贴墙挂机”
             self.wall_stall_steps += 1
             stall_penalty = min(
                 WALL_STALL_PENALTY_SCALE
                 * self.wall_stall_steps
                 * wall_pressure
-                * (0.4 + 0.6 * float(np.clip(danger_score, 0.0, 1.0))),
+                * (0.85 + 0.75 * float(np.clip(danger_score, 0.0, 1.0))),
                 WALL_STALL_PENALTY_CAP,
             )
             reward -= stall_penalty

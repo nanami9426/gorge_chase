@@ -44,22 +44,48 @@ def make_conv_layer(in_channels, out_channels, kernel_size, stride=1, padding=0)
     return conv
 
 
-class Model(nn.Module):
-    """Hybrid dense + CNN backbone with Actor/Critic heads.
+def make_gru_layer(input_size, hidden_size):
+    """Create a GRU layer with orthogonal initialization.
 
-    稠密特征分支 + CNN 空间分支骨干，接 Actor/Critic 双头。
+    创建带正交初始化的 GRU。
+    """
+    gru = nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        batch_first=True,
+    )
+    for name, param in gru.named_parameters():
+        if "weight" in name:
+            nn.init.orthogonal_(param.data)
+        else:
+            nn.init.zeros_(param.data)
+    return gru
+
+
+class Model(nn.Module):
+    """Hybrid per-frame encoder + temporal GRU with Actor/Critic heads.
+
+    单帧稠密特征分支 + CNN 空间分支编码，再由 GRU 聚合最近几帧，
+    最后接 Actor/Critic 双头。
     """
 
     def __init__(self, device=None):
         super().__init__()
-        self.model_name = "gorge_chase_lite"
+        self.model_name = "gorge_chase_temporal_gru"
         self.device = device
 
         dense_dim = Config.DENSE_FEATURE_LEN
+        frame_feature_len = Config.FRAME_FEATURE_LEN
         spatial_map_size = Config.SPATIAL_MAP_SIZE
         spatial_channels = Config.SPATIAL_CHANNELS
+        temporal_window = Config.TEMPORAL_WINDOW
         action_num = Config.ACTION_NUM
         value_num = Config.VALUE_NUM
+        frame_embed_dim = Config.FRAME_EMBED_DIM
+        temporal_hidden_dim = Config.TEMPORAL_HIDDEN_DIM
+
+        self.frame_feature_len = frame_feature_len
+        self.temporal_window = temporal_window
 
         self.dense_backbone = nn.Sequential(
             make_fc_layer(dense_dim, 64),
@@ -81,8 +107,15 @@ class Model(nn.Module):
             nn.ReLU(),
         )
 
+        self.frame_fusion = nn.Sequential(
+            make_fc_layer(128, frame_embed_dim),
+            nn.ReLU(),
+        )
+
+        self.temporal_encoder = make_gru_layer(frame_embed_dim, temporal_hidden_dim)
+
         self.fusion = nn.Sequential(
-            make_fc_layer(128, 128),
+            make_fc_layer(frame_embed_dim + temporal_hidden_dim, 128),
             nn.ReLU(),
         )
 
@@ -93,9 +126,10 @@ class Model(nn.Module):
         self.critic_head = make_fc_layer(128, value_num)
 
     def forward(self, obs, inference=False):
-        dense_obs = obs[:, : Config.DENSE_FEATURE_LEN]
-        spatial_obs = obs[:, Config.DENSE_FEATURE_LEN :]
-        spatial_obs = spatial_obs.reshape(
+        obs = obs.reshape(-1, self.temporal_window, self.frame_feature_len)
+
+        dense_obs = obs[:, :, : Config.DENSE_FEATURE_LEN].reshape(-1, Config.DENSE_FEATURE_LEN)
+        spatial_obs = obs[:, :, Config.DENSE_FEATURE_LEN :].reshape(
             -1,
             Config.SPATIAL_CHANNELS,
             Config.SPATIAL_MAP_SIZE,
@@ -104,7 +138,13 @@ class Model(nn.Module):
 
         dense_hidden = self.dense_backbone(dense_obs)
         spatial_hidden = self.spatial_proj(self.spatial_backbone(spatial_obs))
-        hidden = self.fusion(torch.cat([dense_hidden, spatial_hidden], dim=1))
+        frame_hidden = self.frame_fusion(torch.cat([dense_hidden, spatial_hidden], dim=1))
+        frame_hidden = frame_hidden.reshape(-1, self.temporal_window, Config.FRAME_EMBED_DIM)
+
+        _, temporal_state = self.temporal_encoder(frame_hidden)
+        current_hidden = frame_hidden[:, -1, :]
+        temporal_hidden = temporal_state[-1]
+        hidden = self.fusion(torch.cat([current_hidden, temporal_hidden], dim=1))
         logits = self.actor_head(hidden)
         value = self.critic_head(hidden)
         return logits, value

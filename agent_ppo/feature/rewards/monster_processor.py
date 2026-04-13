@@ -6,7 +6,8 @@ MAX_MAP_DISTANCE = MAP_SIZE * 1.41
 MAX_MONSTER_SPEED = 5.0
 MAX_MONSTER_DIST_BUCKET = 5.0
 MONSTER_FEATURE_COUNT = 2
-MONSTER_DIST_REWARD_SCALE = 0.1
+MONSTER_DIST_REWARD_AWAY_SCALE = 0.04
+MONSTER_DIST_APPROACH_SCALE = 0.14
 SQRT_HALF = float(np.sqrt(0.5))
 
 DIR_TO_VEC = {
@@ -80,7 +81,14 @@ class MonsterProcessor:
         for m_feat in monster_feats:
             cur_min_dist_norm = min(cur_min_dist_norm, float(m_feat[4]))
 
-        # 远离最近的怪物，远离->正，接近->负
-        dist_shaping = MONSTER_DIST_REWARD_SCALE * (cur_min_dist_norm - self.last_min_monster_dist_norm)
+        # 对最近怪物的距离变化做非对称 shaping：
+        # 1. 远离时给较小的正奖励，避免“拉开一点就站桩”
+        # 2. 靠近时给更强的负奖励，强调后期贴脸风险
+        delta_dist_norm = cur_min_dist_norm - self.last_min_monster_dist_norm
+        if delta_dist_norm >= 0.0:
+            dist_shaping = MONSTER_DIST_REWARD_AWAY_SCALE * delta_dist_norm
+        else:
+            dist_shaping = MONSTER_DIST_APPROACH_SCALE * delta_dist_norm
+
         self.last_min_monster_dist_norm = cur_min_dist_norm
         return dist_shaping
