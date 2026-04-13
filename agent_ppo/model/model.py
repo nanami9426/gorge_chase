@@ -12,7 +12,6 @@ Neural network model for Gorge Chase PPO.
 
 import torch
 import torch.nn as nn
-import numpy as np
 
 from agent_ppo.conf.conf import Config
 
@@ -28,10 +27,27 @@ def make_fc_layer(in_features, out_features):
     return fc
 
 
-class Model(nn.Module):
-    """Single MLP backbone + Actor/Critic dual heads.
+def make_conv_layer(in_channels, out_channels, kernel_size, stride=1, padding=0):
+    """Create a conv layer with orthogonal initialization.
 
-    单 MLP 骨干 + Actor/Critic 双头。
+    创建正交初始化的卷积层。
+    """
+    conv = nn.Conv2d(
+        in_channels,
+        out_channels,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+    )
+    nn.init.orthogonal_(conv.weight.data)
+    nn.init.zeros_(conv.bias.data)
+    return conv
+
+
+class Model(nn.Module):
+    """Hybrid dense + CNN backbone with Actor/Critic heads.
+
+    稠密特征分支 + CNN 空间分支骨干，接 Actor/Critic 双头。
     """
 
     def __init__(self, device=None):
@@ -39,28 +55,56 @@ class Model(nn.Module):
         self.model_name = "gorge_chase_lite"
         self.device = device
 
-        input_dim = Config.DIM_OF_OBSERVATION
-        hidden_dim = 128
-        mid_dim = 64
+        dense_dim = Config.DENSE_FEATURE_LEN
+        spatial_map_size = Config.SPATIAL_MAP_SIZE
+        spatial_channels = Config.SPATIAL_CHANNELS
         action_num = Config.ACTION_NUM
         value_num = Config.VALUE_NUM
 
-        # Shared backbone / 共享骨干网络
-        self.backbone = nn.Sequential(
-            make_fc_layer(input_dim, hidden_dim),
+        self.dense_backbone = nn.Sequential(
+            make_fc_layer(dense_dim, 64),
             nn.ReLU(),
-            make_fc_layer(hidden_dim, mid_dim),
+        )
+
+        self.spatial_backbone = nn.Sequential(
+            make_conv_layer(spatial_channels, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            make_conv_layer(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            make_conv_layer(32, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+        )
+        conv_output_size = spatial_map_size // 4 + 1
+        self.spatial_proj = nn.Sequential(
+            nn.Flatten(),
+            make_fc_layer(32 * conv_output_size * conv_output_size, 64),
+            nn.ReLU(),
+        )
+
+        self.fusion = nn.Sequential(
+            make_fc_layer(128, 128),
             nn.ReLU(),
         )
 
         # Actor head / 策略头
-        self.actor_head = make_fc_layer(mid_dim, action_num)
+        self.actor_head = make_fc_layer(128, action_num)
 
         # Critic head / 价值头
-        self.critic_head = make_fc_layer(mid_dim, value_num)
+        self.critic_head = make_fc_layer(128, value_num)
 
     def forward(self, obs, inference=False):
-        hidden = self.backbone(obs)
+        dense_obs = obs[:, : Config.DENSE_FEATURE_LEN]
+        spatial_obs = obs[:, Config.DENSE_FEATURE_LEN :]
+        spatial_obs = spatial_obs.reshape(
+            -1,
+            Config.SPATIAL_CHANNELS,
+            Config.SPATIAL_MAP_SIZE,
+            Config.SPATIAL_MAP_SIZE,
+        )
+
+        dense_hidden = self.dense_backbone(dense_obs)
+        spatial_hidden = self.spatial_proj(self.spatial_backbone(spatial_obs))
+        hidden = self.fusion(torch.cat([dense_hidden, spatial_hidden], dim=1))
         logits = self.actor_head(hidden)
         value = self.critic_head(hidden)
         return logits, value

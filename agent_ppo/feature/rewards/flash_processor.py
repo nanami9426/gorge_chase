@@ -45,10 +45,13 @@ class FlashProcessor:
         danger_score = 0.75 * near_pressure + 0.20 * nearest_speed_norm + 0.05 * nearest_in_view
         return float(np.clip(danger_score, 0.0, 1.0))
 
-    def calc_danger_score(self, monster_feats, wall_pressure=0.0, corner_pressure=0.0) -> float:
+    def calc_danger_score(self, monster_feats, terrain_stats=None) -> float:
         # 在基础怪物危险度上叠加“贴墙/死角”困境，避免等到贴脸才开始逃
         base_danger = self.calc_base_danger_score(monster_feats)
-        danger_score = base_danger + 0.15 * float(wall_pressure) + 0.10 * float(corner_pressure)
+        min_dist_norm, _, _ = self.get_nearest_monster_stats(monster_feats)
+        terrain_stats = terrain_stats or {}
+        trap_risk = float(terrain_stats.get("trap_risk", 0.0))
+        danger_score = base_danger + trap_risk * (0.20 + 0.45 * (1.0 - min_dist_norm))
         return float(np.clip(danger_score, 0.0, 1.0))
 
     def should_allow_flash(self, danger_score) -> bool:

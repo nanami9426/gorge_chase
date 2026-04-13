@@ -10,6 +10,7 @@ Training workflow for Gorge Chase PPO.
 峡谷追猎 PPO 训练工作流。
 """
 
+from copy import deepcopy
 import os
 import time
 from collections import defaultdict
@@ -26,6 +27,59 @@ PHASE_LOG_ORDER = [
     "phase_1_double_monster",
     "phase_2_speedup_survival",
 ]
+
+CURRICULUM_STAGES = (
+    (
+        200,
+        "curriculum_stage_1_bootstrap",
+        {
+            "map": [1, 2, 3],
+            "map_random": True,
+            "treasure_count": 6,
+            "buff_count": 2,
+            "monster_interval": 450,
+            "monster_speedup": 700,
+            "max_step": 800,
+        },
+    ),
+    (
+        600,
+        "curriculum_stage_2_expand",
+        {
+            "map": [1, 2, 3, 4, 5],
+            "map_random": True,
+            "treasure_count": 8,
+            "buff_count": 2,
+            "monster_interval": 380,
+            "monster_speedup": 600,
+            "max_step": 900,
+        },
+    ),
+    (
+        float("inf"),
+        "curriculum_stage_3_full",
+        {
+            "map": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "treasure_count": 10,
+            "buff_count": 2,
+            "monster_interval": 300,
+            "monster_speedup": 500,
+            "max_step": 1000,
+        },
+    ),
+)
+
+
+def build_episode_usr_conf(base_usr_conf, episode_idx):
+    episode_usr_conf = deepcopy(base_usr_conf)
+    env_conf = episode_usr_conf.setdefault("env_conf", {})
+
+    for max_episode, curriculum_stage, overrides in CURRICULUM_STAGES:
+        if episode_idx <= max_episode:
+            env_conf.update(deepcopy(overrides))
+            return episode_usr_conf, curriculum_stage
+
+    return episode_usr_conf, CURRICULUM_STAGES[-1][1]
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     last_save_model_time = time.time()
@@ -82,8 +136,13 @@ class EpisodeRunner:
                 if training_metrics is not None:
                     self.logger.info(f"training_metrics is {training_metrics}")
 
+            episode_idx = self.episode_cnt + 1
+            episode_usr_conf, curriculum_stage = build_episode_usr_conf(
+                base_usr_conf=self.usr_conf,
+                episode_idx=episode_idx,
+            )
             # Reset env / 重置环境
-            env_obs = self.env.reset(self.usr_conf)
+            env_obs = self.env.reset(episode_usr_conf)
 
             # Disaster recovery / 容灾处理
             if handle_disaster_recovery(env_obs, self.logger):
@@ -95,6 +154,7 @@ class EpisodeRunner:
 
             # Initial observation / 初始观测处理
             obs_data, remain_info = self.agent.observation_process(env_obs)
+            remain_info["curriculum_stage"] = curriculum_stage
 
             collector = []
             self.episode_cnt += 1
@@ -104,8 +164,12 @@ class EpisodeRunner:
             terminal_phase = "unknown"
             phase_step_counts = defaultdict(int)
             reward_breakdown_sum = defaultdict(float)
+            risk_metric_sum = defaultdict(float)
+            behavior_metric_sum = defaultdict(float)
 
-            self.logger.info(f"Episode {self.episode_cnt} start")
+            self.logger.info(
+                f"Episode {self.episode_cnt} start curriculum_stage:{curriculum_stage}"
+            )
 
             while not done:
                 # Predict action / Agent 推理（随机采样）
@@ -129,6 +193,7 @@ class EpisodeRunner:
 
                 # Next observation / 处理下一步观测
                 _obs_data, _remain_info = self.agent.observation_process(env_obs)
+                _remain_info["curriculum_stage"] = curriculum_stage
 
                 # Step reward / 每步即时奖励
                 reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
@@ -138,6 +203,21 @@ class EpisodeRunner:
                 weighted_breakdown = _remain_info.get("reward_breakdown", {}).get("weighted", {})
                 for key, value in weighted_breakdown.items():
                     reward_breakdown_sum[key] += float(value)
+                for key in (
+                    "danger_score",
+                    "trap_risk",
+                    "wall_pressure",
+                    "corner_pressure",
+                    "risk_pruned_moves",
+                ):
+                    risk_metric_sum[key] += float(_remain_info.get(key, 0.0))
+                for key in (
+                    "explore_new_grid",
+                    "frontier_bonus",
+                    "explore_streak_bonus",
+                    "buff_priority_weight",
+                ):
+                    behavior_metric_sum[key] += float(_remain_info.get(key, 0.0))
 
                 # Terminal reward / 终局奖励
                 final_reward = np.zeros(1, dtype=np.float32)
@@ -157,8 +237,9 @@ class EpisodeRunner:
                     self.logger.info(
                         f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
                         f"result:{result_str} sim_score:{total_score:.1f} "
-                        f"treasures:{treasures_collected} buffs:{collected_buff} "
-                        f"total_reward:{total_reward:.3f} terminal_phase:{terminal_phase}"
+                        f"treasures:{treasures_collected} buffs_collected:{collected_buff} "
+                        f"total_reward:{total_reward:.3f} terminal_phase:{terminal_phase} "
+                        f"curriculum_stage:{curriculum_stage}"
                     )
                     phase_step_counts_log = {
                         phase_name: phase_step_counts.get(phase_name, 0) for phase_name in PHASE_LOG_ORDER
@@ -167,10 +248,33 @@ class EpisodeRunner:
                         key: round(value / max(step, 1), 4)
                         for key, value in sorted(reward_breakdown_sum.items())
                     }
+                    risk_metric_mean = {
+                        key: round(value / max(step, 1), 4)
+                        for key, value in sorted(risk_metric_sum.items())
+                    }
+                    explore_new_grids = int(round(behavior_metric_sum.get("explore_new_grid", 0.0)))
+                    frontier_bonus_mean = round(
+                        behavior_metric_sum.get("frontier_bonus", 0.0) / max(step, 1),
+                        4,
+                    )
+                    explore_streak_mean = round(
+                        behavior_metric_sum.get("explore_streak_bonus", 0.0) / max(step, 1),
+                        4,
+                    )
+                    buff_priority_weight_mean = round(
+                        behavior_metric_sum.get("buff_priority_weight", 0.0) / max(step, 1),
+                        4,
+                    )
                     self.logger.info(
                         f"[PHASE] episode:{self.episode_cnt} terminal_phase:{terminal_phase} "
                         f"phase_step_counts:{phase_step_counts_log} "
-                        f"reward_breakdown_mean:{reward_breakdown_mean}"
+                        f"reward_breakdown_mean:{reward_breakdown_mean} "
+                        f"risk_metric_mean:{risk_metric_mean} "
+                        f"explore_new_grids:{explore_new_grids} "
+                        f"frontier_bonus_mean:{frontier_bonus_mean} "
+                        f"explore_streak_mean:{explore_streak_mean} "
+                        f"buff_priority_weight_mean:{buff_priority_weight_mean} "
+                        f"curriculum_stage:{curriculum_stage}"
                     )
 
                 # Build sample frame / 构造样本帧
@@ -201,6 +305,7 @@ class EpisodeRunner:
                             "episode_steps": step,
                             "episode_cnt": self.episode_cnt,
                             "treasures_collected": treasures_collected,
+                            "buffs_collected": collected_buff,
                         }
                         self.monitor.put_data({os.getpid(): monitor_data})
                         self.last_report_monitor_time = now

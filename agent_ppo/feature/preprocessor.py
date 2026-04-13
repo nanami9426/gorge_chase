@@ -18,6 +18,7 @@ from agent_ppo.feature.rewards import MonsterProcessor
 from agent_ppo.feature.rewards import MoveProcessor
 from agent_ppo.feature.rewards import PhaseProcessor
 from agent_ppo.feature.rewards import TerrainProcessor
+from agent_ppo.feature.spatial_encoder import SpatialFeatureEncoder
 
 # Map size / 地图尺寸（128×128）
 MAP_SIZE = 128.0
@@ -26,6 +27,12 @@ MAX_FLASH_CD = 2000.0
 # Max buff duration / buff最大持续时间
 MAX_BUFF_DURATION = 50.0
 STEP_SCORE_REWARD_SCALE = 0.003
+RISK_PRUNE_WALL_PRESSURE_THRESHOLD = 0.55
+RISK_PRUNE_CORNER_PRESSURE_THRESHOLD = 0.50
+RISK_PRUNE_DELTA = 0.18
+RISK_PRUNE_RATIO = 0.55
+RISK_PRUNE_MIN_LEGAL_MOVES = 3
+RISK_PRUNE_KEEP_TOPK = 2
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -35,6 +42,8 @@ def _norm(v, v_max, v_min=0.0):
     """
     v = float(np.clip(v, v_min, v_max))
     return (v - v_min) / (v_max - v_min) if (v_max - v_min) > 1e-6 else 0.0
+
+
 class Preprocessor:
     def __init__(self):
         self.organ_processor = OrganProcessor()
@@ -44,6 +53,7 @@ class Preprocessor:
         self.move_processor = MoveProcessor()
         self.phase_processor = PhaseProcessor()
         self.terrain_processor = TerrainProcessor()
+        self.spatial_encoder = SpatialFeatureEncoder()
         self.reset()
 
     def reset(self):
@@ -63,6 +73,40 @@ class Preprocessor:
         step_score_gain = max(0.0, step_score - self.last_step_score)
         self.last_step_score = step_score
         return STEP_SCORE_REWARD_SCALE * step_score_gain
+
+    def prune_risky_moves(self, legal_action, terrain_stats):
+        masked_action = list(legal_action)
+        if terrain_stats["wall_pressure"] < RISK_PRUNE_WALL_PRESSURE_THRESHOLD and (
+            terrain_stats["corner_pressure"] < RISK_PRUNE_CORNER_PRESSURE_THRESHOLD
+        ):
+            return masked_action, 0
+
+        legal_move_indices = [idx for idx in range(8) if masked_action[idx] == 1]
+        if len(legal_move_indices) < RISK_PRUNE_MIN_LEGAL_MOVES:
+            return masked_action, 0
+
+        escape_dir_scores = terrain_stats["escape_dir_scores"]
+        scored_moves = [(idx, float(escape_dir_scores[idx])) for idx in legal_move_indices]
+        best_score = max(score for _, score in scored_moves)
+        keep_threshold = max(best_score - RISK_PRUNE_DELTA, RISK_PRUNE_RATIO * best_score)
+        keep_indices = {idx for idx, score in scored_moves if score >= keep_threshold}
+        top_indices = [
+            idx
+            for idx, _ in sorted(
+                scored_moves,
+                key=lambda item: (item[1], -item[0]),
+                reverse=True,
+            )[:RISK_PRUNE_KEEP_TOPK]
+        ]
+        keep_indices.update(top_indices)
+
+        risk_pruned_moves = 0
+        for idx in legal_move_indices:
+            if idx not in keep_indices:
+                masked_action[idx] = 0
+                risk_pruned_moves += 1
+
+        return masked_action, risk_pruned_moves
 
     def feature_process(self, env_obs, last_action):
         # last_action：0~7：移动 8~15：闪现
@@ -103,18 +147,14 @@ class Preprocessor:
         # OrganState[] 物件状态列表（宝箱、buff）
         organs = frame_state.get("organs", [])
         organs_feat = self.organ_processor.get_feats(organs=organs, hero_pos=hero_pos)
-
-        # Local map features (16D) / 局部地图特征
-        # 将局部信息转成1*16的向量
-        map_feat = np.zeros(16, dtype=np.float32)
-        if map_info is not None and len(map_info) >= 13:
-            center = len(map_info) // 2
-            flat_idx = 0 # 压平后的下标：4*4->16，即0~15
-            for row in range(center - 2, center + 2):
-                for col in range(center - 2, center + 2):
-                    if 0 <= row < len(map_info) and 0 <= col < len(map_info[0]):
-                        map_feat[flat_idx] = float(map_info[row][col] != 0)
-                    flat_idx += 1
+        explore_feat = self.explore_processor.get_feats(hero_pos=hero_pos)
+        normalized_map_info, spatial_feat = self.spatial_encoder.encode(
+            map_info=map_info,
+            monsters=monsters,
+            organs=organs,
+            hero_pos=hero_pos,
+        )
+        map_info_for_logic = normalized_map_info if normalized_map_info is not None else map_info
 
         # 合法动作掩码 0~7移动，8~15闪现
         legal_action = [1] * 16
@@ -131,18 +171,21 @@ class Preprocessor:
 
         legal_action, move_mask = self.move_processor.mask_legal_action(
             legal_action=legal_action,
-            map_info=map_info,
+            map_info=map_info_for_logic,
         )
         terrain_stats = self.terrain_processor.extract_stats(
-            map_info=map_info,
+            map_info=map_info_for_logic,
             move_mask=move_mask,
             monster_vec=nearest_monster_vec,
+        )
+        legal_action, risk_pruned_moves = self.prune_risky_moves(
+            legal_action=legal_action,
+            terrain_stats=terrain_stats,
         )
         terrain_feat = self.terrain_processor.get_feats(terrain_stats=terrain_stats)
         danger_score = self.flash_processor.calc_danger_score(
             monster_feats=monster_feats,
-            wall_pressure=terrain_stats["wall_pressure"],
-            corner_pressure=terrain_stats["corner_pressure"],
+            terrain_stats=terrain_stats,
         )
         legal_action = self.flash_processor.mask_legal_action(
             legal_action=legal_action,
@@ -153,25 +196,37 @@ class Preprocessor:
         step_norm = _norm(self.step_no, self.max_step)
         progress_feat = np.array([step_norm, danger_score], dtype=np.float32)
 
-        # Concatenate features / 拼接特征
-        feature = np.concatenate(
+        # Dense features stay in front, spatial branch is flattened after them.
+        dense_feature = np.concatenate(
             [
                 hero_feat,
                 monster_feats[0],
                 monster_feats[1],
                 organs_feat,
-                map_feat,
+                explore_feat,
                 terrain_feat,
                 np.array(legal_action, dtype=np.float32),
                 progress_feat,
                 phase_feat,
             ]
         )
+        feature = np.concatenate([dense_feature, spatial_feat.reshape(-1)])
 
         # Step reward / 即时奖励
         monster_dist_reward = self.monster_processor.calc_reward(monster_feats=monster_feats)
-        explore_reward = self.explore_processor.calc_reward(hero_pos=hero_pos)
-        organ_reward = self.organ_processor.calc_reward(env_info=env_info, organs=organs, hero_pos=hero_pos)
+        explore_reward_info = self.explore_processor.calc_reward(
+            hero_pos=hero_pos,
+            step_no=self.step_no,
+            danger_score=danger_score,
+        )
+        organ_reward = self.organ_processor.calc_reward(
+            env_info=env_info,
+            organs=organs,
+            hero_pos=hero_pos,
+            hero=hero,
+            terrain_stats=terrain_stats,
+            danger_score=danger_score,
+        )
         progress_reward = self.calc_progress_reward(env_info=env_info)
         flash_reward = self.flash_processor.calc_reward(last_action=last_action, danger_score=danger_score)
         move_reward = self.move_processor.calc_reward(last_action=last_action, move_mask=move_mask)
@@ -186,7 +241,7 @@ class Preprocessor:
         raw_reward_breakdown = {
             "progress_reward": float(progress_reward),
             "monster_dist_reward": float(monster_dist_reward),
-            "explore_reward": float(explore_reward),
+            "explore_reward": float(explore_reward_info["reward"]),
             "treasure_reward": float(organ_reward["treasure_reward"]),
             "buff_reward": float(organ_reward["buff_reward"]),
             "treasure_stall_penalty": float(organ_reward["treasure_stall_penalty"]),
@@ -206,6 +261,16 @@ class Preprocessor:
             "phase_name": phase_name,
             "monster_count": int(monster_count),
             "max_monster_speed": int(max_monster_speed),
+            "danger_score": float(danger_score),
+            "trap_risk": float(terrain_stats["trap_risk"]),
+            "wall_pressure": float(terrain_stats["wall_pressure"]),
+            "corner_pressure": float(terrain_stats["corner_pressure"]),
+            "risk_pruned_moves": int(risk_pruned_moves),
+            "explore_new_grid": int(explore_reward_info["explore_new_grid"]),
+            "frontier_bonus": float(explore_reward_info["frontier_bonus"]),
+            "explore_streak_bonus": float(explore_reward_info["explore_streak_bonus"]),
+            "buff_priority_weight": float(organ_reward["buff_priority_weight"]),
+            "buffs_collected": int(organ_reward["buffs_collected"]),
             "reward_breakdown": {
                 "raw": raw_reward_breakdown,
                 "weights": phase_weights,

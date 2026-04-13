@@ -84,16 +84,22 @@ class Algorithm:
         if now - self.last_report_monitor_time >= 60:
             results = {
                 "total_loss": round(total_loss.item(), 4),
-                "value_loss": round(info_list[0].item(), 4),
-                "policy_loss": round(info_list[1].item(), 4),
-                "entropy_loss": round(info_list[2].item(), 4),
+                "value_loss": round(info_list["value_loss"].item(), 4),
+                "policy_loss": round(info_list["policy_loss"].item(), 4),
+                "entropy_loss": round(info_list["entropy_loss"].item(), 4),
+                "approx_kl": round(info_list["approx_kl"].item(), 4),
+                "clipfrac": round(info_list["clipfrac"].item(), 4),
+                "value_target_std": round(info_list["value_target_std"].item(), 4),
                 "reward": round(reward.mean().item(), 4),
             }
             self.logger.info(
                 f"[train] total_loss:{results['total_loss']} "
                 f"policy_loss:{results['policy_loss']} "
                 f"value_loss:{results['value_loss']} "
-                f"entropy:{results['entropy_loss']}"
+                f"entropy:{results['entropy_loss']} "
+                f"approx_kl:{results['approx_kl']} "
+                f"clipfrac:{results['clipfrac']} "
+                f"value_target_std:{results['value_target_std']}"
             )
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
@@ -123,10 +129,13 @@ class Algorithm:
         new_prob = (one_hot * prob_dist).sum(1, keepdim=True)
         old_action_prob = (one_hot * old_prob).sum(1, keepdim=True).clamp(1e-9)
         ratio = new_prob / old_action_prob
+        log_ratio = torch.log(new_prob.clamp(1e-9)) - torch.log(old_action_prob)
         adv = advantage.view(-1, 1)
         policy_loss1 = -ratio * adv
         policy_loss2 = -ratio.clamp(1 - self.clip_param, 1 + self.clip_param) * adv
         policy_loss = torch.maximum(policy_loss1, policy_loss2).mean()
+        approx_kl = ((ratio - 1.0) - log_ratio).mean()
+        clipfrac = (torch.abs(ratio - 1.0) > self.clip_param).float().mean()
 
         # Value loss (Clipped) / 价值损失
         vp = value_pred
@@ -143,11 +152,19 @@ class Algorithm:
 
         # Entropy loss / 熵损失
         entropy_loss = (-prob_dist * torch.log(prob_dist.clamp(1e-9, 1))).sum(1).mean()
+        value_target_std = tdret.std(unbiased=False)
 
         # Total loss / 总损失
         total_loss = self.vf_coef * value_loss + policy_loss - self.var_beta * entropy_loss
 
-        return total_loss, [value_loss, policy_loss, entropy_loss]
+        return total_loss, {
+            "value_loss": value_loss,
+            "policy_loss": policy_loss,
+            "entropy_loss": entropy_loss,
+            "approx_kl": approx_kl,
+            "clipfrac": clipfrac,
+            "value_target_std": value_target_std,
+        }
 
     def _masked_softmax(self, logits, legal_action):
         """Softmax with legal action masking (suppress illegal actions).

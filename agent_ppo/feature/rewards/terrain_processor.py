@@ -16,13 +16,16 @@ OPEN_FIELD_BONUS_SCALE = 0.012
 WALL_PRESSURE_THRESHOLD = 0.42
 
 # 贴墙压力处罚强度
-WALL_PRESSURE_PENALTY_SCALE = 0.024
+WALL_PRESSURE_PENALTY_SCALE = 0.05
 
 # 可逃方向比例过低时的阈值
 LOW_ESCAPE_THRESHOLD = 0.375
 
 # 可逃方向太少时的处罚强度
-LOW_ESCAPE_PENALTY_SCALE = 0.018
+LOW_ESCAPE_PENALTY_SCALE = 0.04
+
+# 死角压力处罚强度
+CORNER_PRESSURE_PENALTY_SCALE = 0.03
 
 # 中等危险开始逐步偏向显式逃跑
 ESCAPE_WEIGHT_START = 0.35
@@ -31,8 +34,12 @@ ESCAPE_WEIGHT_RANGE = 0.35
 # 逃跑方向和动作对齐奖励强度
 ESCAPE_ACTION_REWARD_SCALE = 0.08
 
+# 仍然沿墙平移而不是向开阔区脱离时的额外处罚
+WALL_FOLLOW_PRESSURE_THRESHOLD = 0.55
+WALL_FOLLOW_PENALTY_SCALE = 0.03
+
 # 贴墙停滞处罚参数
-WALL_STALL_PENALTY_SCALE = 0.012
+WALL_STALL_PENALTY_SCALE = 0.02
 WALL_STALL_PENALTY_CAP = 0.20
 
 MOVE_DIRS = [
@@ -184,6 +191,12 @@ class TerrainProcessor:
             )
         )
 
+    def calc_trap_risk(self, escape_ratio, wall_pressure, corner_pressure) -> float:
+        low_escape_gap = max(0.0, LOW_ESCAPE_THRESHOLD - float(escape_ratio))
+        low_escape_pressure = low_escape_gap / max(LOW_ESCAPE_THRESHOLD, 1e-6)
+        trap_risk = 0.45 * float(wall_pressure) + 0.35 * float(corner_pressure) + 0.20 * low_escape_pressure
+        return float(np.clip(trap_risk, 0.0, 1.0))
+
     def extract_stats(self, map_info, move_mask, monster_vec=None):
         openness = self.calc_openness_ratio(map_info)
         escape_ratio = (
@@ -196,6 +209,11 @@ class TerrainProcessor:
         wall_pressure = float(np.clip(wall_pressure, 0.0, 1.0))
         corner_pressure = 1.0 - 0.5 * (escape_ratio + min_clearance)
         corner_pressure = float(np.clip(corner_pressure, 0.0, 1.0))
+        trap_risk = self.calc_trap_risk(
+            escape_ratio=escape_ratio,
+            wall_pressure=wall_pressure,
+            corner_pressure=corner_pressure,
+        )
         escape_dir_scores = self.calc_escape_dir_scores(clearances, move_mask, monster_vec)
         return {
             "openness": openness,
@@ -204,6 +222,7 @@ class TerrainProcessor:
             "min_clearance": min_clearance,
             "wall_pressure": wall_pressure,
             "corner_pressure": corner_pressure,
+            "trap_risk": trap_risk,
             "clearances": clearances,
             "escape_dir_scores": escape_dir_scores,
         }
@@ -214,6 +233,9 @@ class TerrainProcessor:
                 terrain_stats["openness"],
                 terrain_stats["escape_ratio"],
                 terrain_stats["avg_clearance"],
+                terrain_stats["min_clearance"],
+                terrain_stats["wall_pressure"],
+                terrain_stats["corner_pressure"],
                 *terrain_stats["escape_dir_scores"],
             ],
             dtype=np.float32,
@@ -227,32 +249,32 @@ class TerrainProcessor:
         corner_pressure = terrain_stats["corner_pressure"]
         escape_dir_scores = terrain_stats["escape_dir_scores"]
 
-        positioning_weight = self.calc_positioning_weight(danger_score)
+        preemptive_weight = float(max(0.6, 1.0 - 0.5 * float(np.clip(danger_score, 0.0, 1.0))))
         escape_weight = self.calc_escape_weight(danger_score)
         reward = 0.0
 
         if self.last_openness is not None:
             # 当前比上一帧更开阔
-            reward += positioning_weight * OPENNESS_DELTA_REWARD_SCALE * (openness - self.last_openness)
+            reward += preemptive_weight * OPENNESS_DELTA_REWARD_SCALE * (openness - self.last_openness)
         if self.last_clearance is not None:
             # 当前平均净空更大
-            reward += positioning_weight * CLEARANCE_DELTA_REWARD_SCALE * (avg_clearance - self.last_clearance)
+            reward += preemptive_weight * CLEARANCE_DELTA_REWARD_SCALE * (avg_clearance - self.last_clearance)
 
         # 如果已经身处较开阔区域，给少量正反馈
-        reward += positioning_weight * OPEN_FIELD_BONUS_SCALE * max(0.0, openness - OPEN_FIELD_TARGET)
+        reward += preemptive_weight * OPEN_FIELD_BONUS_SCALE * max(0.0, openness - OPEN_FIELD_TARGET)
 
         if wall_pressure > WALL_PRESSURE_THRESHOLD:
             # 贴墙压力过大时，按超过阈值的程度处罚
             pressure_ratio = (wall_pressure - WALL_PRESSURE_THRESHOLD) / max(1.0 - WALL_PRESSURE_THRESHOLD, 1e-6)
-            reward -= positioning_weight * WALL_PRESSURE_PENALTY_SCALE * pressure_ratio
+            reward -= preemptive_weight * WALL_PRESSURE_PENALTY_SCALE * pressure_ratio
 
         if escape_ratio < LOW_ESCAPE_THRESHOLD:
             # 能走的方向太少，说明位置偏狭窄，不利于后续拉扯
             escape_gap = (LOW_ESCAPE_THRESHOLD - escape_ratio) / max(LOW_ESCAPE_THRESHOLD, 1e-6)
-            reward -= positioning_weight * LOW_ESCAPE_PENALTY_SCALE * escape_gap
+            reward -= preemptive_weight * LOW_ESCAPE_PENALTY_SCALE * escape_gap
 
         # 避免模型偏好死角
-        reward -= positioning_weight * 0.012 * corner_pressure
+        reward -= preemptive_weight * CORNER_PRESSURE_PENALTY_SCALE * corner_pressure
 
         if self.last_escape_dir_scores is not None and last_action is not None:
             action_idx = int(last_action)
@@ -267,6 +289,21 @@ class TerrainProcessor:
         moved = True
         if self.last_hero_pos is not None:
             moved = cur_pos != self.last_hero_pos
+
+        if (
+            moved
+            and wall_pressure >= WALL_FOLLOW_PRESSURE_THRESHOLD
+            and self.last_escape_dir_scores is not None
+            and self.last_openness is not None
+            and last_action is not None
+        ):
+            action_idx = int(last_action)
+            if 0 <= action_idx < 16:
+                dir_idx = action_idx % MOVE_ACTION_NUM
+                escape_score = float(self.last_escape_dir_scores[dir_idx])
+                mean_escape_score = float(np.mean(self.last_escape_dir_scores))
+                if escape_score < mean_escape_score and openness <= self.last_openness + 1e-6:
+                    reward -= WALL_FOLLOW_PENALTY_SCALE * wall_pressure * (1.0 - escape_score)
 
         if moved or wall_pressure <= WALL_PRESSURE_THRESHOLD:
             # 一旦移动了，或者已经不算贴墙，就清空停滞计数

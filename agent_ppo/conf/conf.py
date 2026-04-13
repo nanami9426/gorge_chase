@@ -13,21 +13,30 @@ Configuration for Gorge Chase PPO.
 
 class Config:
 
-    # 特征维度
-    FEATURES = [
+    # Dense feature dimensions / 稠密特征维度
+    DENSE_FEATURES = [
         4,
         5,
         5,
         8,
-        16,
-        11,
+        3,
+        14,
         16,
         2,
         5,
     ]
-    
-    FEATURE_SPLIT_SHAPE = FEATURES
-    FEATURE_LEN = sum(FEATURE_SPLIT_SHAPE)
+
+    # Spatial observation branch / 空间观测分支
+    SPATIAL_MAP_SIZE = 13
+    SPATIAL_CHANNELS = 4
+
+    # Backward-compatible aliases / 兼容旧配置名
+    FEATURES = DENSE_FEATURES
+    FEATURE_SPLIT_SHAPE = DENSE_FEATURES
+
+    DENSE_FEATURE_LEN = sum(DENSE_FEATURES)
+    SPATIAL_FEATURE_LEN = SPATIAL_CHANNELS * SPATIAL_MAP_SIZE * SPATIAL_MAP_SIZE
+    FEATURE_LEN = DENSE_FEATURE_LEN + SPATIAL_FEATURE_LEN
     DIM_OF_OBSERVATION = FEATURE_LEN
 
     # Action space / 动作空间：16个移动方向
