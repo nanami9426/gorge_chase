@@ -82,7 +82,7 @@ class MonsterProcessor:
             cur_min_dist_norm = min(cur_min_dist_norm, float(m_feat[4]))
 
         # 对最近怪物的距离变化做非对称 shaping：
-        # 1. 远离时给较小的正奖励，避免“拉开一点就站桩”
+        # 1. 远离时给较小的正奖励，避免挂机
         # 2. 靠近时给更强的负奖励，强调后期贴脸风险
         delta_dist_norm = cur_min_dist_norm - self.last_min_monster_dist_norm
         if delta_dist_norm >= 0.0:

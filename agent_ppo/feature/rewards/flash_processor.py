@@ -5,9 +5,9 @@ import numpy as np
 FLASH_ACTION_START = 8
 FLASH_ACTION_END = 16
 # 只有危险度达到该阈值，才允许使用闪现
-FLASH_DANGER_THRESHOLD = 0.50
+FLASH_DANGER_THRESHOLD = 0.70
 # 在安全状态下误用闪现时的惩罚强度
-SAFE_FLASH_PENALTY_SCALE = 0.18
+SAFE_FLASH_PENALTY_SCALE = 0.22
 
 
 class FlashProcessor:
