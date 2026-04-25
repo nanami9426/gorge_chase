@@ -13,38 +13,78 @@ PHASE_NAME_BY_ID = {
     PHASE_SPEEDUP_SURVIVAL: "phase_2_speedup_survival",
 }
 
+CURRICULUM_SURVIVAL_BOOTSTRAP = "curriculum_survival_bootstrap"
+CURRICULUM_LOOT_UNLOCK = "curriculum_loot_unlock"
+CURRICULUM_FULL = "curriculum_full"
+
 PHASE_REWARD_WEIGHTS = {
     "phase_0_loot": {
-        "progress_reward": 1.00,
-        "monster_dist_reward": 0.95,
-        "explore_reward": 1.35,
+        "progress_reward": 1.05,
+        "monster_dist_reward": 1.05,
+        "explore_reward": 1.15,
         "treasure_reward": 1.00,
         "buff_reward": 1.25,
         "treasure_stall_penalty": 1.15,
-        "terrain_reward": 1.10,
-        "flash_reward": 0.90,
+        "terrain_reward": 1.15,
+        "flash_reward": 1.00,
         "move_reward": 1.00,
     },
     "phase_1_double_monster": {
-        "progress_reward": 1.10,
-        "monster_dist_reward": 1.60,
-        "explore_reward": 0.85,
-        "treasure_reward": 0.70,
-        "buff_reward": 1.10,
+        "progress_reward": 1.25,
+        "monster_dist_reward": 2.10,
+        "explore_reward": 0.70,
+        "treasure_reward": 0.55,
+        "buff_reward": 1.55,
         "treasure_stall_penalty": 1.15,
-        "terrain_reward": 1.40,
-        "flash_reward": 1.15,
+        "terrain_reward": 1.75,
+        "flash_reward": 1.35,
         "move_reward": 1.00,
     },
     "phase_2_speedup_survival": {
-        "progress_reward": 1.20,
-        "monster_dist_reward": 1.90,
-        "explore_reward": 0.35,
-        "treasure_reward": 0.35,
-        "buff_reward": 0.90,
+        "progress_reward": 1.40,
+        "monster_dist_reward": 2.50,
+        "explore_reward": 0.25,
+        "treasure_reward": 0.25,
+        "buff_reward": 1.80,
         "treasure_stall_penalty": 1.25,
-        "terrain_reward": 1.65,
-        "flash_reward": 1.30,
+        "terrain_reward": 2.10,
+        "flash_reward": 1.60,
+        "move_reward": 1.00,
+    },
+}
+
+CURRICULUM_REWARD_WEIGHTS = {
+    CURRICULUM_SURVIVAL_BOOTSTRAP: {
+        "progress_reward": 1.35,
+        "monster_dist_reward": 1.45,
+        "explore_reward": 0.75,
+        "treasure_reward": 0.55,
+        "buff_reward": 1.35,
+        "treasure_stall_penalty": 0.75,
+        "terrain_reward": 1.35,
+        "flash_reward": 1.25,
+        "move_reward": 1.00,
+    },
+    CURRICULUM_LOOT_UNLOCK: {
+        "progress_reward": 1.10,
+        "monster_dist_reward": 1.15,
+        "explore_reward": 1.00,
+        "treasure_reward": 1.00,
+        "buff_reward": 1.40,
+        "treasure_stall_penalty": 1.00,
+        "terrain_reward": 1.10,
+        "flash_reward": 1.05,
+        "move_reward": 1.00,
+    },
+    CURRICULUM_FULL: {
+        "progress_reward": 1.00,
+        "monster_dist_reward": 1.00,
+        "explore_reward": 1.00,
+        "treasure_reward": 1.00,
+        "buff_reward": 1.00,
+        "treasure_stall_penalty": 1.00,
+        "terrain_reward": 1.00,
+        "flash_reward": 1.00,
         "move_reward": 1.00,
     },
 }
@@ -96,10 +136,44 @@ class PhaseProcessor:
     def get_reward_weights(self, phase_name):
         return dict(PHASE_REWARD_WEIGHTS[str(phase_name)])
 
-    def weight_reward_breakdown(self, raw_reward_breakdown, phase_name):
+    def get_curriculum_weights(self, curriculum_stage=None, loot_reward_scale=None):
+        curriculum_stage = curriculum_stage or CURRICULUM_LOOT_UNLOCK
+        weights = dict(
+            CURRICULUM_REWARD_WEIGHTS.get(
+                str(curriculum_stage),
+                CURRICULUM_REWARD_WEIGHTS[CURRICULUM_LOOT_UNLOCK],
+            )
+        )
+        if loot_reward_scale is not None:
+            loot_reward_scale = float(np.clip(loot_reward_scale, 0.05, 1.50))
+            weights["treasure_reward"] = loot_reward_scale
+        return weights
+
+    def weight_reward_breakdown(
+        self,
+        raw_reward_breakdown,
+        phase_name,
+        curriculum_stage=None,
+        loot_reward_scale=None,
+    ):
         phase_weights = self.get_reward_weights(phase_name)
+        curriculum_weights = self.get_curriculum_weights(
+            curriculum_stage=curriculum_stage,
+            loot_reward_scale=loot_reward_scale,
+        )
+        combined_weights = {
+            key: float(phase_weights[key] * curriculum_weights.get(key, 1.0))
+            for key in phase_weights
+        }
         weighted_reward_breakdown = {
-            key: float(raw_reward_breakdown[key] * phase_weights[key]) for key in phase_weights
+            key: float(raw_reward_breakdown[key] * combined_weights[key])
+            for key in phase_weights
         }
         total_reward = float(sum(weighted_reward_breakdown.values()))
-        return phase_weights, weighted_reward_breakdown, total_reward
+        return (
+            phase_weights,
+            curriculum_weights,
+            combined_weights,
+            weighted_reward_breakdown,
+            total_reward,
+        )

@@ -11,10 +11,16 @@ EXPLORE_STREAK_BONUS_SCALE = 0.008
 EXPLORE_STREAK_BONUS_CAP = 0.05
 MOVE_REWARD_SCALE = 0.004
 MOVE_REWARD_CAP = 2.0
-REVISIT_GRID_PENALTY = -0.004
-NON_RECENT_REVISIT_REWARD = 0.02
+REVISIT_GRID_PENALTY = -0.012
+NON_RECENT_REVISIT_REWARD = 0.006
 STALL_PENALTY_SCALE = 0.005
 STALL_PENALTY_CAP = 0.18
+NO_PROGRESS_PENALTY_START = 5
+NO_PROGRESS_PENALTY_SCALE = 0.012
+NO_PROGRESS_PENALTY_CAP = 0.24
+LOCAL_LOOP_PENALTY_START = 4
+LOCAL_LOOP_PENALTY_SCALE = 0.006
+LOCAL_LOOP_PENALTY_CAP = 0.14
 RECENT_GRID_WINDOW = 15
 VISIT_COUNT_NORM_CAP = 6.0
 NO_PROGRESS_NORM_CAP = 20.0
@@ -104,7 +110,15 @@ class ExploreProcessor:
         revisit_count = max(1.0, float(visit_count_after - 1))
         return float(NON_RECENT_REVISIT_REWARD / math.sqrt(revisit_count))
 
-    def calc_reward(self, hero_pos, step_no, danger_score):
+    def calc_positioning_need(self, terrain_stats) -> float:
+        terrain_stats = terrain_stats or {}
+        dead_end_risk = float(terrain_stats.get("dead_end_risk", 0.0))
+        readiness_score = float(terrain_stats.get("readiness_score", 1.0))
+        dead_end_need = max(0.0, dead_end_risk - 0.25) / 0.75
+        readiness_need = max(0.0, 0.58 - readiness_score) / 0.58
+        return float(np.clip(0.65 * dead_end_need + 0.35 * readiness_need, 0.0, 1.0))
+
+    def calc_reward(self, hero_pos, step_no, danger_score, terrain_stats=None):
         context = self.get_context(hero_pos)
         grid = context["grid"]
         explore_new_grid = context["explore_new_grid"]
@@ -149,14 +163,42 @@ class ExploreProcessor:
             self.stall_steps += 1
         stall_penalty = -min(STALL_PENALTY_SCALE * self.stall_steps, STALL_PENALTY_CAP)
 
+        positioning_need = self.calc_positioning_need(terrain_stats)
+        safe_wait_weight = float(np.clip(1.0 - 0.65 * float(danger_score), 0.35, 1.0))
+        no_progress_over = max(0, context["no_progress_steps"] - NO_PROGRESS_PENALTY_START)
+        no_progress_penalty = -min(
+            NO_PROGRESS_PENALTY_SCALE
+            * no_progress_over
+            * safe_wait_weight
+            * (0.45 + positioning_need),
+            NO_PROGRESS_PENALTY_CAP,
+        )
+        local_loop_over = max(0, context["visit_count_after"] - LOCAL_LOOP_PENALTY_START)
+        local_loop_penalty = -min(
+            LOCAL_LOOP_PENALTY_SCALE
+            * local_loop_over
+            * safe_wait_weight
+            * (0.40 + positioning_need),
+            LOCAL_LOOP_PENALTY_CAP,
+        )
+
         self.visited_grid_counts[grid] = context["visit_count_after"]
         self.no_progress_steps = context["no_progress_steps"]
         self.explore_streak_steps = explore_streak_steps
         self.last_hero_pos = cur_pos
         self.recent_grids.append(grid)
         return {
-            "reward": float(positive_reward + revisit_adjustment + stall_penalty),
+            "reward": float(
+                positive_reward
+                + revisit_adjustment
+                + stall_penalty
+                + no_progress_penalty
+                + local_loop_penalty
+            ),
             "explore_new_grid": int(explore_new_grid),
             "frontier_bonus": float(safe_explore_weight * frontier_bonus),
             "explore_streak_bonus": float(safe_explore_weight * explore_streak_bonus),
+            "no_progress_penalty": float(no_progress_penalty),
+            "local_loop_penalty": float(local_loop_penalty),
+            "positioning_need": float(positioning_need),
         }

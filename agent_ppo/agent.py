@@ -55,16 +55,22 @@ class Agent(BaseAgent):
         self.last_action = -1
         self.feature_history.clear()
 
-    def observation_process(self, env_obs):
+    def observation_process(self, env_obs, curriculum_stage=None, loot_reward_scale=None):
         """Convert raw env_obs to ObsData and remain_info.
 
         将原始观测转换为 ObsData 和 remain_info。
         """
-        frame_feature, legal_action, remain_info = self.preprocessor.feature_process(env_obs, self.last_action)
+        frame_feature, legal_action, remain_info = self.preprocessor.feature_process(
+            env_obs,
+            self.last_action,
+            curriculum_stage=curriculum_stage,
+            loot_reward_scale=loot_reward_scale,
+        )
         feature = self._stack_temporal_feature(frame_feature)
         obs_data = ObsData(
             feature=list(feature),
             legal_action=legal_action,
+            action_prior=remain_info.get("action_prior", [0.0] * Config.ACTION_NUM),
         )
         return obs_data, remain_info
 
@@ -75,8 +81,9 @@ class Agent(BaseAgent):
         """
         feature = list_obs_data[0].feature
         legal_action = list_obs_data[0].legal_action
+        action_prior = getattr(list_obs_data[0], "action_prior", None)
 
-        logits, value, prob = self._run_model(feature, legal_action)
+        logits, value, prob = self._run_model(feature, legal_action, action_prior=action_prior)
 
         action = self._legal_sample(prob, use_max=False)
         d_action = self._legal_sample(prob, use_max=True)
@@ -145,7 +152,7 @@ class Agent(BaseAgent):
         self.last_action = int(action[0])
         return int(action[0])
 
-    def _run_model(self, feature, legal_action):
+    def _run_model(self, feature, legal_action, action_prior=None):
         """Run model inference, return logits, value, prob.
 
         执行模型推理，返回 logits、value 和动作概率。
@@ -161,7 +168,10 @@ class Agent(BaseAgent):
 
         # Legal action masked softmax / 合法动作掩码 softmax
         legal_action_np = np.array(legal_action, dtype=np.float32)
+        action_prior_np = self._normalize_action_prior(action_prior, legal_action_np)
+        logits_np = logits_np + float(Config.ACTION_PRIOR_LOGIT_SCALE) * action_prior_np
         prob = self._legal_soft_max(logits_np, legal_action_np)
+        prob = self._apply_sampling_floor(prob, legal_action_np)
 
         return logits_np, value_np, prob
 
@@ -205,3 +215,27 @@ class Agent(BaseAgent):
         if use_max:
             return int(np.argmax(probs))
         return int(np.argmax(np.random.multinomial(1, probs, size=1)))
+
+    def _apply_sampling_floor(self, probs, legal_action):
+        floor = float(Config.SAMPLING_PROB_FLOOR)
+        if floor <= 0.0:
+            return probs
+
+        legal_mask = np.array(legal_action, dtype=np.float32)
+        legal_count = float(np.sum(legal_mask))
+        if legal_count <= 1.0:
+            return probs
+
+        uniform_prob = legal_mask / legal_count
+        mixed_prob = (1.0 - floor) * probs + floor * uniform_prob
+        return mixed_prob / (np.sum(mixed_prob, keepdims=True) * 1.00001)
+
+    def _normalize_action_prior(self, action_prior, legal_action):
+        if action_prior is None:
+            return np.zeros(Config.ACTION_NUM, dtype=np.float32)
+
+        prior = np.array(action_prior, dtype=np.float32)
+        if prior.shape[0] != Config.ACTION_NUM:
+            prior = np.zeros(Config.ACTION_NUM, dtype=np.float32)
+        prior = np.clip(prior, 0.0, 1.0) * legal_action
+        return prior

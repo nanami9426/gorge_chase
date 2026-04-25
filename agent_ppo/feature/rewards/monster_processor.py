@@ -6,8 +6,8 @@ MAX_MAP_DISTANCE = MAP_SIZE * 1.41
 MAX_MONSTER_SPEED = 5.0
 MAX_MONSTER_DIST_BUCKET = 5.0
 MONSTER_FEATURE_COUNT = 2
-MONSTER_DIST_REWARD_AWAY_SCALE = 0.04
-MONSTER_DIST_APPROACH_SCALE = 0.14
+MONSTER_DIST_REWARD_AWAY_SCALE = 0.075
+MONSTER_DIST_APPROACH_SCALE = 0.24
 SQRT_HALF = float(np.sqrt(0.5))
 
 DIR_TO_VEC = {
@@ -35,7 +35,7 @@ class MonsterProcessor:
         self.reset()
 
     def reset(self):
-        self.last_min_monster_dist_norm = 0.5
+        self.last_min_monster_dist_norm = None
 
     def direction_to_vector(self, direction_idx):
         return DIR_TO_VEC.get(int(direction_idx), (0.0, 0.0))
@@ -81,14 +81,20 @@ class MonsterProcessor:
         for m_feat in monster_feats:
             cur_min_dist_norm = min(cur_min_dist_norm, float(m_feat[4]))
 
+        if self.last_min_monster_dist_norm is None:
+            self.last_min_monster_dist_norm = cur_min_dist_norm
+            return 0.0
+
         # 对最近怪物的距离变化做非对称 shaping：
         # 1. 远离时给较小的正奖励，避免挂机
         # 2. 靠近时给更强的负奖励，强调后期贴脸风险
         delta_dist_norm = cur_min_dist_norm - self.last_min_monster_dist_norm
+        close_pressure = 1.0 - cur_min_dist_norm
+        urgency_scale = 1.0 + 0.75 * close_pressure
         if delta_dist_norm >= 0.0:
-            dist_shaping = MONSTER_DIST_REWARD_AWAY_SCALE * delta_dist_norm
+            dist_shaping = urgency_scale * MONSTER_DIST_REWARD_AWAY_SCALE * delta_dist_norm
         else:
-            dist_shaping = MONSTER_DIST_APPROACH_SCALE * delta_dist_norm
+            dist_shaping = urgency_scale * MONSTER_DIST_APPROACH_SCALE * delta_dist_norm
 
         self.last_min_monster_dist_norm = cur_min_dist_norm
         return dist_shaping

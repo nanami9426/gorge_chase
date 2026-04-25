@@ -20,7 +20,7 @@ class Config:
         5,
         8,
         3,
-        14,
+        26,
         16,
         2,
         5,
@@ -57,8 +57,14 @@ class Config:
     # PPO hyperparameters / PPO 超参数
     GAMMA = 0.99
     LAMDA = 0.95
-    INIT_LEARNING_RATE_START = 0.0003
-    BETA_START = 0.001
+    INIT_LEARNING_RATE_START = 0.0002
+    BETA_START = 0.003
+    BETA_MIN = 0.0005
+    BETA_MAX = 0.02
+    ENTROPY_TARGET_RATIO = 0.55
+    ENTROPY_BETA_ADJUST_RATE = 0.05
     CLIP_PARAM = 0.2
-    VF_COEF = 1.0
+    VF_COEF = 0.5
     GRAD_CLIP_RANGE = 0.5
+    SAMPLING_PROB_FLOOR = 0.03
+    ACTION_PRIOR_LOGIT_SCALE = 2.2

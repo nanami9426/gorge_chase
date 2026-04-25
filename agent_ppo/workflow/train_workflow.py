@@ -13,73 +13,172 @@ Training workflow for Gorge Chase PPO.
 from copy import deepcopy
 import os
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 from agent_ppo.feature.definition import SampleData, sample_process
+from agent_ppo.feature.rewards.phase_processor import CURRICULUM_FULL
+from agent_ppo.feature.rewards.phase_processor import CURRICULUM_LOOT_UNLOCK
+from agent_ppo.feature.rewards.phase_processor import CURRICULUM_SURVIVAL_BOOTSTRAP
 from tools.metrics_utils import get_training_metrics
 from tools.train_env_conf_validate import read_usr_conf
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 
 MODEL_SAVE_INTERVAL = 60 * 10
+SURVIVAL_PROMOTION_WINDOW = 8
+SURVIVAL_PROMOTION_STREAK = 3
+FULL_PROMOTION_WINDOW = 10
+FULL_PROMOTION_STREAK = 3
 PHASE_LOG_ORDER = [
     "phase_0_loot",
     "phase_1_double_monster",
     "phase_2_speedup_survival",
 ]
 
-CURRICULUM_STAGES = (
-    (
-        200,
-        "curriculum_stage_1_bootstrap",
-        {
-            "map": [1, 2, 3],
-            "map_random": True,
+CURRICULUM_STAGE_CONFIG = {
+    CURRICULUM_SURVIVAL_BOOTSTRAP: {
+        "env_overrides": {
             "treasure_count": 6,
             "buff_count": 2,
-            "monster_interval": 450,
+            "monster_interval": 500,
             "monster_speedup": 700,
-            "max_step": 800,
+            "max_step": 1000,
         },
-    ),
-    (
-        600,
-        "curriculum_stage_2_expand",
-        {
-            "map": [1, 2, 3, 4, 5],
-            "map_random": True,
-            "treasure_count": 8,
+        "loot_reward_scale": 0.55,
+    },
+    CURRICULUM_LOOT_UNLOCK: {
+        "env_overrides": {
             "buff_count": 2,
-            "monster_interval": 380,
-            "monster_speedup": 600,
-            "max_step": 900,
+            "monster_interval": 340,
+            "monster_speedup": 560,
+            "max_step": 1000,
         },
-    ),
-    (
-        float("inf"),
-        "curriculum_stage_3_full",
-        {
-            "map": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            "treasure_count": 10,
+        "loot_reward_scale": 1.00,
+    },
+    CURRICULUM_FULL: {
+        "env_overrides": {
             "buff_count": 2,
             "monster_interval": 300,
             "monster_speedup": 500,
             "max_step": 1000,
         },
-    ),
-)
+        "loot_reward_scale": 1.00,
+    },
+}
 
 
-def build_episode_usr_conf(base_usr_conf, episode_idx):
+class CurriculumTracker:
+    """Promote difficulty only after the policy can reliably reach midgame."""
+
+    def __init__(self):
+        self.curriculum_stage = CURRICULUM_SURVIVAL_BOOTSTRAP
+        self.stage_episode_idx = 0
+        self.recent_episodes = deque(maxlen=max(SURVIVAL_PROMOTION_WINDOW, FULL_PROMOTION_WINDOW))
+        self.promotion_streak = 0
+
+    def get_stage(self):
+        return self.curriculum_stage
+
+    def get_stage_episode_idx(self):
+        return self.stage_episode_idx
+
+    def _build_metrics(self):
+        if not self.recent_episodes:
+            return {
+                "avg_step_ratio": 0.0,
+                "midgame_rate": 0.0,
+                "lategame_rate": 0.0,
+                "survival_rate": 0.0,
+                "phase_2_rate": 0.0,
+                "post_speedup_rate": 0.0,
+                "avg_phase_2_steps": 0.0,
+                "window_size": 0,
+                "promotion_streak": self.promotion_streak,
+            }
+
+        window = list(self.recent_episodes)
+        step_ratios = [episode["step_ratio"] for episode in window]
+        return {
+            "avg_step_ratio": float(np.mean(step_ratios)),
+            "midgame_rate": float(np.mean([ratio >= 0.55 for ratio in step_ratios])),
+            "lategame_rate": float(np.mean([ratio >= 0.80 for ratio in step_ratios])),
+            "survival_rate": float(np.mean([episode["survived"] for episode in window])),
+            "phase_2_rate": float(np.mean([episode["reached_phase_2"] for episode in window])),
+            "post_speedup_rate": float(np.mean([episode["phase_2_steps"] >= 100 for episode in window])),
+            "avg_phase_2_steps": float(np.mean([episode["phase_2_steps"] for episode in window])),
+            "window_size": len(window),
+            "promotion_streak": self.promotion_streak,
+        }
+
+    def _promote(self, next_stage):
+        self.curriculum_stage = next_stage
+        self.stage_episode_idx = 0
+        self.recent_episodes.clear()
+        self.promotion_streak = 0
+
+    def record_episode(self, episode_steps, survived, reached_phase_2, max_step, phase_2_steps=0):
+        max_step = max(int(max_step), 1)
+        episode_steps = max(int(episode_steps), 0)
+        phase_2_steps = max(int(phase_2_steps), 0)
+        step_ratio = float(np.clip(float(episode_steps) / float(max_step), 0.0, 1.0))
+
+        self.stage_episode_idx += 1
+        self.recent_episodes.append(
+            {
+                "step_ratio": step_ratio,
+                "survived": bool(survived),
+                "reached_phase_2": bool(reached_phase_2),
+                "phase_2_steps": phase_2_steps,
+            }
+        )
+
+        promoted = False
+        metrics = self._build_metrics()
+        if self.curriculum_stage == CURRICULUM_SURVIVAL_BOOTSTRAP:
+            ready = (
+                metrics["window_size"] >= SURVIVAL_PROMOTION_WINDOW
+                and metrics["avg_step_ratio"] >= 0.55
+                and metrics["midgame_rate"] >= 0.50
+            )
+            self.promotion_streak = self.promotion_streak + 1 if ready else 0
+            metrics["promotion_streak"] = self.promotion_streak
+            if self.promotion_streak >= SURVIVAL_PROMOTION_STREAK:
+                metrics["promotion_reason"] = "stable_midgame"
+                self._promote(CURRICULUM_LOOT_UNLOCK)
+                promoted = True
+        elif self.curriculum_stage == CURRICULUM_LOOT_UNLOCK:
+            ready = (
+                metrics["window_size"] >= FULL_PROMOTION_WINDOW
+                and metrics["avg_step_ratio"] >= 0.78
+                and metrics["phase_2_rate"] >= 0.50
+                and (metrics["post_speedup_rate"] >= 0.40 or metrics["survival_rate"] >= 0.20)
+            )
+            self.promotion_streak = self.promotion_streak + 1 if ready else 0
+            metrics["promotion_streak"] = self.promotion_streak
+            if self.promotion_streak >= FULL_PROMOTION_STREAK:
+                metrics["promotion_reason"] = "stable_lategame"
+                self._promote(CURRICULUM_FULL)
+                promoted = True
+
+        metrics["curriculum_stage"] = self.curriculum_stage
+        metrics["stage_episode_idx"] = self.stage_episode_idx
+        return metrics, promoted
+
+
+def build_episode_usr_conf(
+    base_usr_conf,
+    curriculum_stage=CURRICULUM_SURVIVAL_BOOTSTRAP,
+    stage_episode_idx=0,
+):
     episode_usr_conf = deepcopy(base_usr_conf)
     env_conf = episode_usr_conf.setdefault("env_conf", {})
+    stage_conf = CURRICULUM_STAGE_CONFIG.get(
+        curriculum_stage,
+        CURRICULUM_STAGE_CONFIG[CURRICULUM_SURVIVAL_BOOTSTRAP],
+    )
+    env_conf.update(deepcopy(stage_conf.get("env_overrides", {})))
+    return episode_usr_conf
 
-    for max_episode, curriculum_stage, overrides in CURRICULUM_STAGES:
-        if episode_idx <= max_episode:
-            env_conf.update(deepcopy(overrides))
-            return episode_usr_conf, curriculum_stage
-
-    return episode_usr_conf, CURRICULUM_STAGES[-1][1]
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     last_save_model_time = time.time()
@@ -121,6 +220,7 @@ class EpisodeRunner:
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
         self.last_get_training_metrics_time = 0
+        self.curriculum_tracker = CurriculumTracker()
 
     def run_episodes(self):
         """Run a single episode and yield collected samples.
@@ -136,11 +236,18 @@ class EpisodeRunner:
                 if training_metrics is not None:
                     self.logger.info(f"training_metrics is {training_metrics}")
 
-            episode_idx = self.episode_cnt + 1
-            episode_usr_conf, curriculum_stage = build_episode_usr_conf(
+            curriculum_stage = self.curriculum_tracker.get_stage()
+            stage_episode_idx = self.curriculum_tracker.get_stage_episode_idx()
+            episode_usr_conf = build_episode_usr_conf(
                 base_usr_conf=self.usr_conf,
-                episode_idx=episode_idx,
+                curriculum_stage=curriculum_stage,
+                stage_episode_idx=stage_episode_idx,
             )
+            stage_conf = CURRICULUM_STAGE_CONFIG.get(
+                curriculum_stage,
+                CURRICULUM_STAGE_CONFIG[CURRICULUM_SURVIVAL_BOOTSTRAP],
+            )
+            loot_reward_scale = stage_conf.get("loot_reward_scale", 1.0)
             # Reset env / 重置环境
             env_obs = self.env.reset(episode_usr_conf)
 
@@ -153,7 +260,11 @@ class EpisodeRunner:
             self.agent.load_model(id="latest")
 
             # Initial observation / 初始观测处理
-            obs_data, remain_info = self.agent.observation_process(env_obs)
+            obs_data, remain_info = self.agent.observation_process(
+                env_obs,
+                curriculum_stage=curriculum_stage,
+                loot_reward_scale=loot_reward_scale,
+            )
             remain_info["curriculum_stage"] = curriculum_stage
 
             collector = []
@@ -168,7 +279,8 @@ class EpisodeRunner:
             behavior_metric_sum = defaultdict(float)
 
             self.logger.info(
-                f"Episode {self.episode_cnt} start curriculum_stage:{curriculum_stage}"
+                f"Episode {self.episode_cnt} start curriculum_stage:{curriculum_stage} "
+                f"stage_episode_idx:{stage_episode_idx}"
             )
 
             while not done:
@@ -192,7 +304,11 @@ class EpisodeRunner:
                 done = terminated or truncated
 
                 # Next observation / 处理下一步观测
-                _obs_data, _remain_info = self.agent.observation_process(env_obs)
+                _obs_data, _remain_info = self.agent.observation_process(
+                    env_obs,
+                    curriculum_stage=curriculum_stage,
+                    loot_reward_scale=loot_reward_scale,
+                )
                 _remain_info["curriculum_stage"] = curriculum_stage
 
                 # Step reward / 每步即时奖励
@@ -206,15 +322,25 @@ class EpisodeRunner:
                 for key in (
                     "danger_score",
                     "trap_risk",
+                    "readiness_score",
+                    "dead_end_risk",
+                    "route_diversity",
                     "wall_pressure",
                     "corner_pressure",
                     "risk_pruned_moves",
+                    "critical_pruned_actions",
+                    "max_flash_dir_score",
+                    "action_prior_max",
+                    "action_prior_sum",
                 ):
                     risk_metric_sum[key] += float(_remain_info.get(key, 0.0))
                 for key in (
                     "explore_new_grid",
                     "frontier_bonus",
                     "explore_streak_bonus",
+                    "no_progress_penalty",
+                    "local_loop_penalty",
+                    "positioning_need",
                     "buff_priority_weight",
                 ):
                     behavior_metric_sum[key] += float(_remain_info.get(key, 0.0))
@@ -223,22 +349,31 @@ class EpisodeRunner:
                 final_reward = np.zeros(1, dtype=np.float32)
                 if done:
                     env_info = env_obs["observation"]["env_info"]
+                    max_step = int(
+                        env_info.get(
+                            "max_step",
+                            episode_usr_conf.get("env_conf", {}).get("max_step", 1000),
+                        )
+                    )
                     total_score = env_info.get("total_score", 0)
                     treasures_collected = env_info.get("treasures_collected", 0)
                     collected_buff = env_info.get("collected_buff", 0)
+                    step_ratio = float(np.clip(float(step) / float(max(max_step, 1)), 0.0, 1.0))
 
                     if terminated:
-                        final_reward[0] = -3.0
+                        early_death_extra = 2.0 * max(0.0, 0.60 - step_ratio) / 0.60
+                        final_reward[0] = -(4.0 + early_death_extra)
                         result_str = "FAIL"
                     else:
-                        final_reward[0] = 1.0
+                        final_reward[0] = 3.0
                         result_str = "WIN"
 
                     self.logger.info(
                         f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
                         f"result:{result_str} sim_score:{total_score:.1f} "
                         f"treasures:{treasures_collected} buffs_collected:{collected_buff} "
-                        f"total_reward:{total_reward:.3f} terminal_phase:{terminal_phase} "
+                        f"total_reward:{total_reward:.3f} final_reward:{final_reward[0]:.2f} "
+                        f"terminal_phase:{terminal_phase} "
                         f"curriculum_stage:{curriculum_stage}"
                     )
                     phase_step_counts_log = {
@@ -261,6 +396,18 @@ class EpisodeRunner:
                         behavior_metric_sum.get("explore_streak_bonus", 0.0) / max(step, 1),
                         4,
                     )
+                    no_progress_penalty_mean = round(
+                        behavior_metric_sum.get("no_progress_penalty", 0.0) / max(step, 1),
+                        4,
+                    )
+                    local_loop_penalty_mean = round(
+                        behavior_metric_sum.get("local_loop_penalty", 0.0) / max(step, 1),
+                        4,
+                    )
+                    positioning_need_mean = round(
+                        behavior_metric_sum.get("positioning_need", 0.0) / max(step, 1),
+                        4,
+                    )
                     buff_priority_weight_mean = round(
                         behavior_metric_sum.get("buff_priority_weight", 0.0) / max(step, 1),
                         4,
@@ -273,9 +420,30 @@ class EpisodeRunner:
                         f"explore_new_grids:{explore_new_grids} "
                         f"frontier_bonus_mean:{frontier_bonus_mean} "
                         f"explore_streak_mean:{explore_streak_mean} "
+                        f"no_progress_penalty_mean:{no_progress_penalty_mean} "
+                        f"local_loop_penalty_mean:{local_loop_penalty_mean} "
+                        f"positioning_need_mean:{positioning_need_mean} "
                         f"buff_priority_weight_mean:{buff_priority_weight_mean} "
                         f"curriculum_stage:{curriculum_stage}"
                     )
+                    curriculum_metrics, promoted = self.curriculum_tracker.record_episode(
+                        episode_steps=step,
+                        survived=not terminated,
+                        reached_phase_2=phase_step_counts.get("phase_2_speedup_survival", 0) > 0,
+                        max_step=max_step,
+                        phase_2_steps=phase_step_counts.get("phase_2_speedup_survival", 0),
+                    )
+                    if promoted:
+                        self.logger.info(
+                            f"[CURRICULUM] promoted_to:{self.curriculum_tracker.get_stage()} "
+                            f"reason:{curriculum_metrics.get('promotion_reason')} "
+                            f"metrics:{curriculum_metrics}"
+                        )
+                    else:
+                        self.logger.info(
+                            f"[CURRICULUM] stage:{self.curriculum_tracker.get_stage()} "
+                            f"metrics:{curriculum_metrics}"
+                        )
 
                 # Build sample frame / 构造样本帧
                 frame = SampleData(
@@ -289,6 +457,7 @@ class EpisodeRunner:
                     next_value=np.zeros(1, dtype=np.float32),
                     advantage=np.zeros(1, dtype=np.float32),
                     prob=np.array(act_data.prob, dtype=np.float32),
+                    action_prior=np.array(obs_data.action_prior, dtype=np.float32),
                 )
                 collector.append(frame)
 

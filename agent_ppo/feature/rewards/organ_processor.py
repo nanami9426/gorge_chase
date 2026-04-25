@@ -6,14 +6,19 @@ MAX_DIST_BUCKET = 5.0
 MAX_MAP_DISTANCE = MAP_SIZE * 1.41
 TREASURE_APPROACH_REWARD_SCALE = 0.30
 TREASURE_NEAR_APPROACH_BONUS = 0.90
-BUFF_APPROACH_REWARD_SCALE = 0.20
-TREASURE_PICKUP_REWARD = 3.0
-BUFF_PICKUP_REWARD = 2.0
+BUFF_APPROACH_REWARD_SCALE = 0.80
+TREASURE_PICKUP_REWARD = 3.5
+BUFF_PICKUP_REWARD = 4.0
 TREASURE_NEAR_DIST_NORM = 10.0 / MAX_MAP_DISTANCE # 近距离宝箱的阈值，大约是6格以内
 TREASURE_STALL_PENALTY_SCALE = 0.02
 TREASURE_STALL_PENALTY_CAP = 0.20
 BUFF_PRIORITY_FAR_DIFF_NORM = 0.06
 BUFF_PRIORITY_FAR_CAP = 0.5
+TREASURE_DANGER_DAMP_START = 0.45
+TREASURE_DANGER_DAMP_END = 0.75
+SAFE_TREASURE_DANGER_THRESHOLD = 0.35
+SAFE_TREASURE_READINESS_THRESHOLD = 0.62
+SAFE_TREASURE_APPROACH_BONUS = 0.35
 SQRT_HALF = float(np.sqrt(0.5))
 
 DIRECTION_TO_VECTOR = {
@@ -117,25 +122,43 @@ class OrganProcessor:
             dtype=np.float32,
         )
 
-    def calc_buff_priority_weight(self, hero, nearest_treasure, nearest_buff) -> float:
+    def calc_buff_priority_weight(self, hero, nearest_treasure, nearest_buff, danger_score=0.0, trap_risk=0.0) -> float:
         if nearest_buff is None:
             return 0.0
 
         hero = hero or {}
+        danger_score = float(np.clip(danger_score, 0.0, 1.0))
+        trap_risk = float(np.clip(trap_risk, 0.0, 1.0))
         buff_remaining_time = float(hero.get("buff_remaining_time", 0.0))
         if buff_remaining_time <= 0.0:
             buff_priority_weight = 1.0
         elif buff_remaining_time <= 8.0:
-            buff_priority_weight = 0.7
+            buff_priority_weight = 0.85
         else:
-            buff_priority_weight = 0.35
+            buff_priority_weight = 0.45
+
+        escape_need_scale = 1.0 + 0.75 * danger_score + 0.35 * trap_risk
+        buff_priority_weight *= escape_need_scale
 
         if (
             nearest_treasure is not None
             and nearest_buff["dist_norm"] - nearest_treasure["dist_norm"] > BUFF_PRIORITY_FAR_DIFF_NORM
         ):
-            buff_priority_weight = min(buff_priority_weight, BUFF_PRIORITY_FAR_CAP)
-        return float(buff_priority_weight)
+            danger_far_cap = BUFF_PRIORITY_FAR_CAP + 0.85 * danger_score + 0.35 * trap_risk
+            buff_priority_weight = min(buff_priority_weight, danger_far_cap)
+        return float(np.clip(buff_priority_weight, 0.0, 2.25))
+
+    def calc_treasure_approach_weight(self, danger_score) -> float:
+        danger_score = float(np.clip(danger_score, 0.0, 1.0))
+        if danger_score <= TREASURE_DANGER_DAMP_START:
+            return 1.0
+        if danger_score >= TREASURE_DANGER_DAMP_END:
+            return 0.0
+        return float(
+            1.0
+            - (danger_score - TREASURE_DANGER_DAMP_START)
+            / max(TREASURE_DANGER_DAMP_END - TREASURE_DANGER_DAMP_START, 1e-6)
+        )
 
     def calc_reward(self, env_info, organs, hero_pos, hero=None, terrain_stats=None, danger_score=0.0):
         available_organs = self.build_available_organs(organs, hero_pos)
@@ -143,13 +166,24 @@ class OrganProcessor:
         nearest_buff = self.select_nearest_organ(available_organs, sub_type=2)
         terrain_stats = terrain_stats or {}
         trap_risk = float(terrain_stats.get("trap_risk", 0.0))
+        readiness_score = float(terrain_stats.get("readiness_score", 0.0))
         approach_scale = 1.0
         if trap_risk >= 0.45:
             approach_scale = float(np.clip(1.0 - 0.5 * trap_risk, 0.5, 1.0))
+        treasure_approach_weight = self.calc_treasure_approach_weight(danger_score)
+        treasure_approach_scale = approach_scale * treasure_approach_weight
+        if (
+            float(danger_score) <= SAFE_TREASURE_DANGER_THRESHOLD
+            and readiness_score >= SAFE_TREASURE_READINESS_THRESHOLD
+        ):
+            treasure_approach_scale *= 1.0 + SAFE_TREASURE_APPROACH_BONUS
+        buff_approach_scale = max(approach_scale, 0.85 + 0.45 * float(np.clip(danger_score, 0.0, 1.0)))
         buff_priority_weight = self.calc_buff_priority_weight(
             hero=hero,
             nearest_treasure=nearest_treasure,
             nearest_buff=nearest_buff,
+            danger_score=danger_score,
+            trap_risk=trap_risk,
         )
 
         treasure_reward = 0.0
@@ -162,16 +196,16 @@ class OrganProcessor:
             )
             treasure_scale = TREASURE_APPROACH_REWARD_SCALE + TREASURE_NEAR_APPROACH_BONUS * close_ratio
             delta_dist = self.last_treasure_dist_norm - nearest_treasure["dist_norm"]
-            
+
             if delta_dist > 0:
-                # 靠近宝箱时放大奖励
-                treasure_reward += approach_scale * treasure_scale * delta_dist
+                # 安全时靠近宝箱给奖励；危险过高时暂停这类 shaping，避免顶怪贪箱。
+                treasure_reward += treasure_approach_scale * treasure_scale * delta_dist
             else:
-                # 若为了绕墙暂时远离，只按基础系数处罚，避免负反馈过重
-                treasure_reward += TREASURE_APPROACH_REWARD_SCALE * delta_dist
+                # 高危险时允许主动远离宝箱去拉开身位，不因为宝箱目标给负反馈。
+                treasure_reward += treasure_approach_scale * TREASURE_APPROACH_REWARD_SCALE * delta_dist
         if nearest_buff is not None and self.last_buff_dist_norm is not None:
             delta_buff_dist = self.last_buff_dist_norm - nearest_buff["dist_norm"]
-            buff_reward += approach_scale * buff_priority_weight * BUFF_APPROACH_REWARD_SCALE * delta_buff_dist
+            buff_reward += buff_approach_scale * buff_priority_weight * BUFF_APPROACH_REWARD_SCALE * delta_buff_dist
 
         # 拾取奖励，通过 treasures_collected 和 collected_buff 判断本帧是否真的完成了拾取
         treasures_collected = int(env_info.get("treasures_collected", 0))
@@ -195,10 +229,10 @@ class OrganProcessor:
                 self.last_treasure_dist_norm is not None
                 and nearest_treasure["dist_norm"] >= self.last_treasure_dist_norm - 1e-6
             )
-            if is_near_treasure and not_getting_closer:
+            if is_near_treasure and not_getting_closer and treasure_approach_weight > 0.0:
                 self.treasure_stall_steps += 1
                 treasure_stall_penalty = -min(
-                    TREASURE_STALL_PENALTY_SCALE * self.treasure_stall_steps,
+                    treasure_approach_weight * TREASURE_STALL_PENALTY_SCALE * self.treasure_stall_steps,
                     TREASURE_STALL_PENALTY_CAP,
                 )
             else:
@@ -216,5 +250,6 @@ class OrganProcessor:
             "buff_reward": float(buff_reward),
             "treasure_stall_penalty": float(treasure_stall_penalty),
             "buff_priority_weight": float(buff_priority_weight),
+            "treasure_approach_weight": float(treasure_approach_weight),
             "buffs_collected": int(collected_buff),
         }

@@ -51,6 +51,7 @@ class Algorithm:
         legal_action = torch.stack([f.legal_action for f in list_sample_data]).to(self.device)
         act = torch.stack([f.act for f in list_sample_data]).to(self.device).view(-1, 1)
         old_prob = torch.stack([f.prob for f in list_sample_data]).to(self.device)
+        action_prior = torch.stack([f.action_prior for f in list_sample_data]).to(self.device)
         reward = torch.stack([f.reward for f in list_sample_data]).to(self.device)
         advantage = torch.stack([f.advantage for f in list_sample_data]).to(self.device)
         old_value = torch.stack([f.value for f in list_sample_data]).to(self.device)
@@ -67,6 +68,7 @@ class Algorithm:
             logits=logits,
             value_pred=value_pred,
             legal_action=legal_action,
+            action_prior=action_prior,
             old_action=act,
             old_prob=old_prob,
             advantage=advantage,
@@ -78,6 +80,10 @@ class Algorithm:
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters, Config.GRAD_CLIP_RANGE)
         self.optimizer.step()
+        self._update_entropy_beta(
+            entropy_loss=info_list["entropy_loss"],
+            entropy_target=info_list["entropy_target"],
+        )
         self.train_step += 1
 
         now = time.time()
@@ -90,6 +96,8 @@ class Algorithm:
                 "approx_kl": round(info_list["approx_kl"].item(), 4),
                 "clipfrac": round(info_list["clipfrac"].item(), 4),
                 "value_target_std": round(info_list["value_target_std"].item(), 4),
+                "entropy_target": round(info_list["entropy_target"].item(), 4),
+                "entropy_beta": round(float(self.var_beta), 6),
                 "reward": round(reward.mean().item(), 4),
             }
             self.logger.info(
@@ -97,6 +105,8 @@ class Algorithm:
                 f"policy_loss:{results['policy_loss']} "
                 f"value_loss:{results['value_loss']} "
                 f"entropy:{results['entropy_loss']} "
+                f"entropy_target:{results['entropy_target']} "
+                f"beta:{results['entropy_beta']} "
                 f"approx_kl:{results['approx_kl']} "
                 f"clipfrac:{results['clipfrac']} "
                 f"value_target_std:{results['value_target_std']}"
@@ -110,6 +120,7 @@ class Algorithm:
         logits,
         value_pred,
         legal_action,
+        action_prior,
         old_action,
         old_prob,
         advantage,
@@ -122,7 +133,7 @@ class Algorithm:
         计算标准 PPO 损失（策略损失 + 价值损失 + 熵正则化）。
         """
         # Masked softmax / 合法动作掩码 softmax
-        prob_dist = self._masked_softmax(logits, legal_action)
+        prob_dist = self._masked_softmax(logits, legal_action, action_prior=action_prior)
 
         # Policy loss (PPO Clip) / 策略损失
         one_hot = torch.nn.functional.one_hot(old_action[:, 0].long(), self.label_size).float()
@@ -142,16 +153,14 @@ class Algorithm:
         ov = old_value
         tdret = reward_sum
         value_clip = ov + (vp - ov).clamp(-self.clip_param, self.clip_param)
-        value_loss = (
-            0.5
-            * torch.maximum(
-                torch.square(tdret - vp),
-                torch.square(tdret - value_clip),
-            ).mean()
-        )
+        value_loss_unclipped = torch.nn.functional.smooth_l1_loss(vp, tdret, reduction="none")
+        value_loss_clipped = torch.nn.functional.smooth_l1_loss(value_clip, tdret, reduction="none")
+        value_loss = torch.maximum(value_loss_unclipped, value_loss_clipped).mean()
 
         # Entropy loss / 熵损失
         entropy_loss = (-prob_dist * torch.log(prob_dist.clamp(1e-9, 1))).sum(1).mean()
+        legal_count = legal_action.sum(dim=1).clamp(min=1.0)
+        entropy_target = (torch.log(legal_count) * Config.ENTROPY_TARGET_RATIO).mean()
         value_target_std = tdret.std(unbiased=False)
 
         # Total loss / 总损失
@@ -161,18 +170,51 @@ class Algorithm:
             "value_loss": value_loss,
             "policy_loss": policy_loss,
             "entropy_loss": entropy_loss,
+            "entropy_target": entropy_target,
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
             "value_target_std": value_target_std,
         }
 
-    def _masked_softmax(self, logits, legal_action):
+    def _update_entropy_beta(self, entropy_loss, entropy_target):
+        entropy_value = float(entropy_loss.detach().cpu().item())
+        target_value = float(entropy_target.detach().cpu().item())
+        adjust_rate = float(Config.ENTROPY_BETA_ADJUST_RATE)
+
+        if entropy_value < target_value * 0.98:
+            self.var_beta *= 1.0 + adjust_rate
+        elif entropy_value > target_value * 1.08:
+            self.var_beta *= 1.0 - adjust_rate
+
+        self.var_beta = float(
+            min(
+                max(self.var_beta, Config.BETA_MIN),
+                Config.BETA_MAX,
+            )
+        )
+
+    def _masked_softmax(self, logits, legal_action, action_prior=None):
         """Softmax with legal action masking (suppress illegal actions).
 
         合法动作掩码下的 softmax（将非法动作概率压为极小值）。
         """
+        if action_prior is not None:
+            action_prior = torch.clamp(action_prior, 0.0, 1.0) * legal_action
+            logits = logits + float(Config.ACTION_PRIOR_LOGIT_SCALE) * action_prior
+
         label_max, _ = torch.max(logits * legal_action, dim=1, keepdim=True)
         label = logits - label_max
         label = label * legal_action
         label = label + 1e5 * (legal_action - 1)
-        return torch.nn.functional.softmax(label, dim=1)
+        prob_dist = torch.nn.functional.softmax(label, dim=1)
+        return self._apply_sampling_floor(prob_dist, legal_action)
+
+    def _apply_sampling_floor(self, prob_dist, legal_action):
+        floor = float(Config.SAMPLING_PROB_FLOOR)
+        if floor <= 0.0:
+            return prob_dist
+
+        legal_count = legal_action.sum(dim=1, keepdim=True).clamp(min=1.0)
+        uniform_prob = legal_action / legal_count
+        mixed_prob = (1.0 - floor) * prob_dist + floor * uniform_prob
+        return mixed_prob / mixed_prob.sum(dim=1, keepdim=True).clamp(min=1e-9)
