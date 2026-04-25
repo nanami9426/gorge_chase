@@ -56,6 +56,12 @@ class Config:
 
     # Value head / 价值头：单头生存奖励
     VALUE_NUM = 1
+    VALUE_HEAD_NUM = 4
+    VALUE_HEAD_TOTAL = 0
+    VALUE_HEAD_SURVIVAL = 1
+    VALUE_HEAD_LOOT = 2
+    VALUE_HEAD_EXPLORE = 3
+    AUX_TARGET_NUM = 3
 
     # PPO hyperparameters / PPO 超参数
     GAMMA = 0.99
@@ -68,6 +74,8 @@ class Config:
     ENTROPY_BETA_ADJUST_RATE = 0.05
     CLIP_PARAM = 0.2
     VF_COEF = 0.5
+    VALUE_HEAD_COEF = 0.25
+    AUX_LOSS_COEF = 0.05
     GRAD_CLIP_RANGE = 0.5
     SAMPLING_PROB_FLOOR = 0.03
     ACTION_PRIOR_LOGIT_SCALE = 1.2

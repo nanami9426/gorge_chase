@@ -80,7 +80,8 @@ class Model(nn.Module):
         spatial_channels = Config.SPATIAL_CHANNELS
         temporal_window = Config.TEMPORAL_WINDOW
         action_num = Config.ACTION_NUM
-        value_num = Config.VALUE_NUM
+        value_head_num = Config.VALUE_HEAD_NUM
+        aux_target_num = Config.AUX_TARGET_NUM
         frame_embed_dim = Config.FRAME_EMBED_DIM
         temporal_hidden_dim = Config.TEMPORAL_HIDDEN_DIM
 
@@ -88,7 +89,11 @@ class Model(nn.Module):
         self.temporal_window = temporal_window
 
         self.dense_backbone = nn.Sequential(
-            make_fc_layer(dense_dim, 64),
+            make_fc_layer(dense_dim, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            make_fc_layer(128, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
         )
 
@@ -97,33 +102,53 @@ class Model(nn.Module):
             nn.ReLU(),
             make_conv_layer(16, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            make_conv_layer(32, 32, kernel_size=3, stride=2, padding=1),
+            make_conv_layer(32, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
         )
         conv_output_size = spatial_map_size // 4 + 1
         self.spatial_proj = nn.Sequential(
             nn.Flatten(),
-            make_fc_layer(32 * conv_output_size * conv_output_size, 64),
+            make_fc_layer(64 * conv_output_size * conv_output_size, 96),
+            nn.LayerNorm(96),
             nn.ReLU(),
         )
 
         self.frame_fusion = nn.Sequential(
-            make_fc_layer(128, frame_embed_dim),
+            make_fc_layer(224, frame_embed_dim),
+            nn.LayerNorm(frame_embed_dim),
             nn.ReLU(),
         )
 
         self.temporal_encoder = make_gru_layer(frame_embed_dim, temporal_hidden_dim)
+        self.temporal_attention = nn.MultiheadAttention(
+            embed_dim=temporal_hidden_dim,
+            num_heads=4,
+            batch_first=True,
+        )
+        self.attention_norm = nn.LayerNorm(temporal_hidden_dim)
 
         self.fusion = nn.Sequential(
-            make_fc_layer(frame_embed_dim + temporal_hidden_dim, 128),
+            make_fc_layer(frame_embed_dim + temporal_hidden_dim * 2, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            make_fc_layer(128, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
         )
 
         # Actor head / 策略头
         self.actor_head = make_fc_layer(128, action_num)
 
-        # Critic head / 价值头
-        self.critic_head = make_fc_layer(128, value_num)
+        # Multi-head critic / 多头价值
+        self.value_head = make_fc_layer(128, value_head_num)
+
+        # Auxiliary prediction head / 辅助预测头
+        self.aux_head = nn.Sequential(
+            make_fc_layer(128, 64),
+            nn.ReLU(),
+            make_fc_layer(64, aux_target_num),
+            nn.Sigmoid(),
+        )
 
     def forward(self, obs, inference=False):
         obs = obs.reshape(-1, self.temporal_window, self.frame_feature_len)
@@ -141,13 +166,22 @@ class Model(nn.Module):
         frame_hidden = self.frame_fusion(torch.cat([dense_hidden, spatial_hidden], dim=1))
         frame_hidden = frame_hidden.reshape(-1, self.temporal_window, Config.FRAME_EMBED_DIM)
 
-        _, temporal_state = self.temporal_encoder(frame_hidden)
+        temporal_sequence, temporal_state = self.temporal_encoder(frame_hidden)
         current_hidden = frame_hidden[:, -1, :]
         temporal_hidden = temporal_state[-1]
-        hidden = self.fusion(torch.cat([current_hidden, temporal_hidden], dim=1))
+        attention_query = temporal_sequence[:, -1:, :]
+        attention_context, _ = self.temporal_attention(
+            query=attention_query,
+            key=temporal_sequence,
+            value=temporal_sequence,
+            need_weights=False,
+        )
+        attention_context = self.attention_norm(attention_context.squeeze(1) + temporal_hidden)
+        hidden = self.fusion(torch.cat([current_hidden, temporal_hidden, attention_context], dim=1))
         logits = self.actor_head(hidden)
-        value = self.critic_head(hidden)
-        return logits, value
+        value_heads = self.value_head(hidden)
+        aux_pred = self.aux_head(hidden)
+        return logits, value_heads, aux_pred
 
     def set_train_mode(self):
         self.train()

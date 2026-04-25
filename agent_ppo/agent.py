@@ -83,7 +83,11 @@ class Agent(BaseAgent):
         legal_action = list_obs_data[0].legal_action
         action_prior = getattr(list_obs_data[0], "action_prior", None)
 
-        logits, value, prob = self._run_model(feature, legal_action, action_prior=action_prior)
+        logits, value, value_heads, aux_pred, prob = self._run_model(
+            feature,
+            legal_action,
+            action_prior=action_prior,
+        )
 
         action = self._legal_sample(prob, use_max=False)
         d_action = self._legal_sample(prob, use_max=True)
@@ -94,6 +98,8 @@ class Agent(BaseAgent):
                 d_action=[d_action],
                 prob=list(prob),
                 value=value,
+                value_heads=value_heads,
+                aux_pred=aux_pred,
             )
         ]
 
@@ -161,10 +167,12 @@ class Agent(BaseAgent):
         obs_tensor = torch.tensor(np.array([feature]), dtype=torch.float32).to(self.device)
 
         with torch.no_grad():
-            logits, value = self.model(obs_tensor, inference=True)
+            logits, value_heads, aux_pred = self.model(obs_tensor, inference=True)
 
         logits_np = logits.cpu().numpy()[0]
-        value_np = value.cpu().numpy()[0]
+        value_heads_np = value_heads.cpu().numpy()[0]
+        value_np = value_heads_np[Config.VALUE_HEAD_TOTAL : Config.VALUE_HEAD_TOTAL + 1]
+        aux_pred_np = aux_pred.cpu().numpy()[0]
 
         # Legal action masked softmax / 合法动作掩码 softmax
         legal_action_np = np.array(legal_action, dtype=np.float32)
@@ -174,7 +182,7 @@ class Agent(BaseAgent):
         prob = self._apply_sampling_floor(prob, legal_action_np)
         prob = self._mix_action_prior(prob, action_prior_np, legal_action_np)
 
-        return logits_np, value_np, prob
+        return logits_np, value_np, value_heads_np, aux_pred_np, prob
 
     def _stack_temporal_feature(self, frame_feature):
         """Build a fixed-length temporal observation from recent frames.

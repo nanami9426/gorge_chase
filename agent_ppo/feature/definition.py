@@ -20,7 +20,7 @@ from agent_ppo.conf.conf import Config
 ObsData = create_cls("ObsData", feature=None, legal_action=None, action_prior=None)
 
 # ActData: action, d_action(greedy), prob, value / 动作、贪心动作、概率、价值
-ActData = create_cls("ActData", action=None, d_action=None, prob=None, value=None)
+ActData = create_cls("ActData", action=None, d_action=None, prob=None, value=None, value_heads=None, aux_pred=None)
 
 # SampleData: single-frame sample with int dims / 单帧样本（整数表示维度）
 SampleData = create_cls(
@@ -30,10 +30,15 @@ SampleData = create_cls(
     act=1,
     reward=Config.VALUE_NUM,
     reward_sum=Config.VALUE_NUM,
+    value_head_reward=Config.VALUE_HEAD_NUM,
+    value_head_sum=Config.VALUE_HEAD_NUM,
     done=1,
     value=Config.VALUE_NUM,
     next_value=Config.VALUE_NUM,
+    value_heads=Config.VALUE_HEAD_NUM,
+    next_value_heads=Config.VALUE_HEAD_NUM,
     advantage=Config.VALUE_NUM,
+    aux_target=Config.AUX_TARGET_NUM,
     prob=Config.ACTION_NUM,
     action_prior=Config.ACTION_NUM,
 )
@@ -46,8 +51,10 @@ def sample_process(list_sample_data):
     """
     for i in range(len(list_sample_data) - 1):
         list_sample_data[i].next_value = list_sample_data[i + 1].value
+        list_sample_data[i].next_value_heads = list_sample_data[i + 1].value_heads
 
     _calc_gae(list_sample_data)
+    _calc_value_head_returns(list_sample_data)
     return list_sample_data
 
 
@@ -65,3 +72,15 @@ def _calc_gae(list_sample_data):
         gae = delta + gamma * lamda * not_done * gae
         sample.advantage = gae
         sample.reward_sum = gae + sample.value
+
+
+def _calc_value_head_returns(list_sample_data):
+    """Compute GAE-style targets for decomposed value heads."""
+    gae = np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32)
+    gamma = Config.GAMMA
+    lamda = Config.LAMDA
+    for sample in reversed(list_sample_data):
+        not_done = 1.0 - sample.done
+        delta = sample.value_head_reward + gamma * sample.next_value_heads * not_done - sample.value_heads
+        gae = delta + gamma * lamda * not_done * gae
+        sample.value_head_sum = gae + sample.value_heads

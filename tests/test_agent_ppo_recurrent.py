@@ -36,10 +36,11 @@ class RecurrentPPOTests(unittest.TestCase):
         model = Model(device="cpu")
         obs = torch.randn(3, Config.DIM_OF_OBSERVATION)
 
-        logits, value = model(obs, inference=True)
+        logits, value_heads, aux_pred = model(obs, inference=True)
 
         self.assertEqual(logits.shape, (3, Config.ACTION_NUM))
-        self.assertEqual(value.shape, (3, Config.VALUE_NUM))
+        self.assertEqual(value_heads.shape, (3, Config.VALUE_HEAD_NUM))
+        self.assertEqual(aux_pred.shape, (3, Config.AUX_TARGET_NUM))
 
     def test_sample_process_computes_gae_targets(self):
         rollout = []
@@ -55,6 +56,11 @@ class RecurrentPPOTests(unittest.TestCase):
                     next_value=np.zeros(1, dtype=np.float32),
                     advantage=np.zeros(1, dtype=np.float32),
                     reward_sum=np.zeros(1, dtype=np.float32),
+                    value_head_reward=np.array([1.0, 0.5, 0.25, 0.25], dtype=np.float32),
+                    value_head_sum=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
+                    value_heads=np.full(Config.VALUE_HEAD_NUM, 0.1 * step_idx, dtype=np.float32),
+                    next_value_heads=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
+                    aux_target=np.array([0.1, 0.5, 0.3], dtype=np.float32),
                     prob=np.full(Config.ACTION_NUM, 1.0 / Config.ACTION_NUM, dtype=np.float32),
                     action_prior=np.zeros(Config.ACTION_NUM, dtype=np.float32),
                 )
@@ -67,6 +73,7 @@ class RecurrentPPOTests(unittest.TestCase):
         for sample in processed:
             self.assertTrue(np.isfinite(sample.advantage).all())
             self.assertTrue(np.isfinite(sample.reward_sum).all())
+            self.assertTrue(np.isfinite(sample.value_head_sum).all())
 
     def test_algorithm_learn_runs_multi_epoch_updates(self):
         rollout = []
@@ -83,6 +90,11 @@ class RecurrentPPOTests(unittest.TestCase):
                     next_value=np.zeros(1, dtype=np.float32),
                     advantage=np.zeros(1, dtype=np.float32),
                     reward_sum=np.zeros(1, dtype=np.float32),
+                    value_head_reward=np.array([reward, 0.5 * reward, 0.25 * reward, 0.25 * reward], dtype=np.float32),
+                    value_head_sum=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
+                    value_heads=np.full(Config.VALUE_HEAD_NUM, 0.05 * step_idx, dtype=np.float32),
+                    next_value_heads=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
+                    aux_target=np.array([0.2, 0.6, 0.4], dtype=np.float32),
                     prob=np.full(Config.ACTION_NUM, 1.0 / Config.ACTION_NUM, dtype=np.float32),
                     action_prior=np.zeros(Config.ACTION_NUM, dtype=np.float32),
                 )
@@ -96,9 +108,14 @@ class RecurrentPPOTests(unittest.TestCase):
             sample.reward = torch.tensor(sample.reward, dtype=torch.float32)
             sample.done = torch.tensor(sample.done, dtype=torch.float32)
             sample.reward_sum = torch.tensor(sample.reward_sum, dtype=torch.float32)
+            sample.value_head_reward = torch.tensor(sample.value_head_reward, dtype=torch.float32)
+            sample.value_head_sum = torch.tensor(sample.value_head_sum, dtype=torch.float32)
             sample.value = torch.tensor(sample.value, dtype=torch.float32)
             sample.next_value = torch.tensor(sample.next_value, dtype=torch.float32)
+            sample.value_heads = torch.tensor(sample.value_heads, dtype=torch.float32)
+            sample.next_value_heads = torch.tensor(sample.next_value_heads, dtype=torch.float32)
             sample.advantage = torch.tensor(sample.advantage, dtype=torch.float32)
+            sample.aux_target = torch.tensor(sample.aux_target, dtype=torch.float32)
             sample.prob = torch.tensor(sample.prob, dtype=torch.float32)
             sample.action_prior = torch.tensor(sample.action_prior, dtype=torch.float32)
         model = Model(device="cpu")
@@ -276,6 +293,39 @@ class RecurrentPPOTests(unittest.TestCase):
         self.assertGreater(action_prior[12], action_prior[0])
         self.assertGreater(action_prior[8 + 4], 0.5)
 
+    def test_action_prior_keeps_treasure_target_under_moderate_danger(self):
+        preprocessor = Preprocessor()
+        legal_action = [1] * Config.ACTION_NUM
+        terrain_stats = {
+            "escape_dir_scores": [0.65, 0.55, 0.45, 0.35, 0.25, 0.30, 0.40, 0.55],
+            "flash_dir_scores": [0.2] * 8,
+            "dead_end_risk": 0.25,
+            "readiness_score": 0.65,
+            "route_diversity": 0.7,
+            "best_flash_score": 0.20,
+        }
+        organs_feat = np.array(
+            [
+                1.0, 0.22, 1.0, 0.0,
+                1.0, 0.30, 0.0, 1.0,
+            ],
+            dtype=np.float32,
+        )
+        treasure_priority_feat = np.array([1.0, 0.22, 1.0, 0.0, 0.72, 1.0, 0.5, 0.8], dtype=np.float32)
+
+        action_prior = preprocessor.build_action_prior(
+            legal_action=legal_action,
+            terrain_stats=terrain_stats,
+            organs_feat=organs_feat,
+            hero={"buff_remaining_time": 20.0},
+            danger_score=0.52,
+            max_monster_speed=1,
+            treasure_priority_feat=treasure_priority_feat,
+        )
+
+        self.assertGreater(action_prior[0], 0.65)
+        self.assertGreater(action_prior[0], action_prior[2])
+
     def test_danger_flash_reward_when_it_reduces_pressure(self):
         flash_processor = FlashProcessor()
         flash_processor.last_danger_score = 0.85
@@ -430,7 +480,7 @@ class RecurrentPPOTests(unittest.TestCase):
         self.assertEqual(loot_conf["env_conf"]["treasure_count"], 10)
         self.assertFalse(loot_conf["env_conf"]["map_random"])
 
-    def test_organ_processor_suppresses_treasure_approach_under_high_danger(self):
+    def test_organ_processor_damps_treasure_approach_under_extreme_danger(self):
         processor = OrganProcessor()
         env_info = {"treasures_collected": 0, "collected_buff": 0}
         hero = {"buff_remaining_time": 0.0}
@@ -459,9 +509,22 @@ class RecurrentPPOTests(unittest.TestCase):
 
         processor.reset()
         processor.calc_reward(env_info, organs_far, hero_pos, hero=hero, terrain_stats={}, danger_score=0.0)
-        danger_reward = processor.calc_reward(env_info, organs_near, hero_pos, hero=hero, terrain_stats={}, danger_score=0.8)
+        moderate_reward = processor.calc_reward(
+            env_info,
+            organs_near,
+            hero_pos,
+            hero=hero,
+            terrain_stats={},
+            danger_score=0.8,
+        )
+
+        processor.reset()
+        processor.calc_reward(env_info, organs_far, hero_pos, hero=hero, terrain_stats={}, danger_score=0.0)
+        danger_reward = processor.calc_reward(env_info, organs_near, hero_pos, hero=hero, terrain_stats={}, danger_score=0.95)
 
         self.assertGreater(safe_reward["treasure_reward"], 0.0)
+        self.assertGreater(moderate_reward["treasure_reward"], 0.0)
+        self.assertLess(moderate_reward["treasure_reward"], safe_reward["treasure_reward"])
         self.assertEqual(danger_reward["treasure_reward"], 0.0)
 
     def test_safe_readiness_boosts_treasure_approach(self):
@@ -598,10 +661,11 @@ class RecurrentPPOTests(unittest.TestCase):
 
         safe_feat = processor.get_priority_feats(organs, hero_pos, terrain_stats=terrain_stats, danger_score=0.1)
         danger_feat = processor.get_priority_feats(organs, hero_pos, terrain_stats=terrain_stats, danger_score=0.9)
+        extreme_feat = processor.get_priority_feats(organs, hero_pos, terrain_stats=terrain_stats, danger_score=0.95)
 
         self.assertEqual(safe_feat.shape, (8,))
         self.assertGreater(float(safe_feat[4]), float(danger_feat[4]))
-        self.assertGreater(float(safe_feat[5]), float(danger_feat[5]))
+        self.assertGreater(float(safe_feat[5]), float(extreme_feat[5]))
 
     def test_memory_features_point_to_known_safe_neighbor(self):
         processor = ExploreProcessor()

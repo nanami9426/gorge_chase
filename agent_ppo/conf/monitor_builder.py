@@ -58,6 +58,26 @@ def build_monitor():
         )
         .end_panel()
         .add_panel(
+            name="多头价值损失",
+            name_en="value_head_loss",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="value_head_loss",
+            expr="avg(value_head_loss{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="辅助任务损失",
+            name_en="aux_loss",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="aux_loss",
+            expr="avg(aux_loss{})",
+        )
+        .end_panel()
+        .add_panel(
             name="策略损失",
             name_en="policy_loss",
             type="line",

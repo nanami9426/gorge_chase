@@ -56,17 +56,23 @@ class Algorithm:
         advantage = torch.stack([f.advantage for f in list_sample_data]).to(self.device)
         old_value = torch.stack([f.value for f in list_sample_data]).to(self.device)
         reward_sum = torch.stack([f.reward_sum for f in list_sample_data]).to(self.device)
+        value_heads = torch.stack([f.value_heads for f in list_sample_data]).to(self.device)
+        value_head_sum = torch.stack([f.value_head_sum for f in list_sample_data]).to(self.device)
+        aux_target = torch.stack([f.aux_target for f in list_sample_data]).to(self.device)
 
         advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
 
         self.model.set_train_mode()
         self.optimizer.zero_grad()
 
-        logits, value_pred = self.model(obs)
+        logits, value_heads_pred, aux_pred = self.model(obs)
+        value_pred = value_heads_pred[:, Config.VALUE_HEAD_TOTAL : Config.VALUE_HEAD_TOTAL + 1]
 
         total_loss, info_list = self._compute_loss(
             logits=logits,
             value_pred=value_pred,
+            value_heads_pred=value_heads_pred,
+            aux_pred=aux_pred,
             legal_action=legal_action,
             action_prior=action_prior,
             old_action=act,
@@ -74,6 +80,8 @@ class Algorithm:
             advantage=advantage,
             old_value=old_value,
             reward_sum=reward_sum,
+            value_head_sum=value_head_sum,
+            aux_target=aux_target,
             reward=reward,
         )
 
@@ -92,6 +100,8 @@ class Algorithm:
                 "total_loss": round(total_loss.item(), 4),
                 "value_loss": round(info_list["value_loss"].item(), 4),
                 "policy_loss": round(info_list["policy_loss"].item(), 4),
+                "value_head_loss": round(info_list["value_head_loss"].item(), 4),
+                "aux_loss": round(info_list["aux_loss"].item(), 4),
                 "entropy_loss": round(info_list["entropy_loss"].item(), 4),
                 "approx_kl": round(info_list["approx_kl"].item(), 4),
                 "clipfrac": round(info_list["clipfrac"].item(), 4),
@@ -104,6 +114,8 @@ class Algorithm:
                 f"[train] total_loss:{results['total_loss']} "
                 f"policy_loss:{results['policy_loss']} "
                 f"value_loss:{results['value_loss']} "
+                f"value_head_loss:{results['value_head_loss']} "
+                f"aux_loss:{results['aux_loss']} "
                 f"entropy:{results['entropy_loss']} "
                 f"entropy_target:{results['entropy_target']} "
                 f"beta:{results['entropy_beta']} "
@@ -119,6 +131,8 @@ class Algorithm:
         self,
         logits,
         value_pred,
+        value_heads_pred,
+        aux_pred,
         legal_action,
         action_prior,
         old_action,
@@ -126,6 +140,8 @@ class Algorithm:
         advantage,
         old_value,
         reward_sum,
+        value_head_sum,
+        aux_target,
         reward,
     ):
         """Compute standard PPO loss (policy + value + entropy).
@@ -157,6 +173,16 @@ class Algorithm:
         value_loss_clipped = torch.nn.functional.smooth_l1_loss(value_clip, tdret, reduction="none")
         value_loss = torch.maximum(value_loss_unclipped, value_loss_clipped).mean()
 
+        if Config.VALUE_HEAD_NUM > 1:
+            value_head_loss = torch.nn.functional.smooth_l1_loss(
+                value_heads_pred[:, 1:],
+                value_head_sum[:, 1:],
+                reduction="mean",
+            )
+        else:
+            value_head_loss = value_loss * 0.0
+        aux_loss = torch.nn.functional.smooth_l1_loss(aux_pred, aux_target, reduction="mean")
+
         # Entropy loss / 熵损失
         entropy_loss = (-prob_dist * torch.log(prob_dist.clamp(1e-9, 1))).sum(1).mean()
         legal_count = legal_action.sum(dim=1).clamp(min=1.0)
@@ -164,10 +190,18 @@ class Algorithm:
         value_target_std = tdret.std(unbiased=False)
 
         # Total loss / 总损失
-        total_loss = self.vf_coef * value_loss + policy_loss - self.var_beta * entropy_loss
+        total_loss = (
+            self.vf_coef * value_loss
+            + Config.VALUE_HEAD_COEF * value_head_loss
+            + Config.AUX_LOSS_COEF * aux_loss
+            + policy_loss
+            - self.var_beta * entropy_loss
+        )
 
         return total_loss, {
             "value_loss": value_loss,
+            "value_head_loss": value_head_loss,
+            "aux_loss": aux_loss,
             "policy_loss": policy_loss,
             "entropy_loss": entropy_loss,
             "entropy_target": entropy_target,

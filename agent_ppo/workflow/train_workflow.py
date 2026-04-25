@@ -16,6 +16,7 @@ import time
 from collections import defaultdict, deque
 
 import numpy as np
+from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import SampleData, sample_process
 from agent_ppo.feature.rewards.phase_processor import CURRICULUM_FULL
 from agent_ppo.feature.rewards.phase_processor import CURRICULUM_LOOT_UNLOCK
@@ -44,7 +45,7 @@ CURRICULUM_STAGE_CONFIG = {
             "monster_speedup": 700,
             "max_step": 1000,
         },
-        "loot_reward_scale": 0.55,
+        "loot_reward_scale": 0.70,
     },
     CURRICULUM_LOOT_UNLOCK: {
         "env_overrides": {
@@ -53,7 +54,7 @@ CURRICULUM_STAGE_CONFIG = {
             "monster_speedup": 560,
             "max_step": 1000,
         },
-        "loot_reward_scale": 1.00,
+        "loot_reward_scale": 1.25,
     },
     CURRICULUM_FULL: {
         "env_overrides": {
@@ -62,9 +63,46 @@ CURRICULUM_STAGE_CONFIG = {
             "monster_speedup": 500,
             "max_step": 1000,
         },
-        "loot_reward_scale": 1.00,
+        "loot_reward_scale": 1.15,
     },
 }
+
+SURVIVAL_REWARD_KEYS = (
+    "progress_reward",
+    "monster_dist_reward",
+    "terrain_reward",
+    "flash_reward",
+)
+LOOT_REWARD_KEYS = (
+    "treasure_reward",
+    "buff_reward",
+    "treasure_stall_penalty",
+)
+EXPLORE_REWARD_KEYS = (
+    "explore_reward",
+    "move_reward",
+)
+
+
+def build_value_head_reward(remain_info, reward):
+    weighted = remain_info.get("reward_breakdown", {}).get("weighted", {})
+    value_head_reward = np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32)
+    value_head_reward[Config.VALUE_HEAD_TOTAL] = float(reward[0])
+    value_head_reward[Config.VALUE_HEAD_SURVIVAL] = sum(float(weighted.get(key, 0.0)) for key in SURVIVAL_REWARD_KEYS)
+    value_head_reward[Config.VALUE_HEAD_LOOT] = sum(float(weighted.get(key, 0.0)) for key in LOOT_REWARD_KEYS)
+    value_head_reward[Config.VALUE_HEAD_EXPLORE] = sum(float(weighted.get(key, 0.0)) for key in EXPLORE_REWARD_KEYS)
+    return value_head_reward
+
+
+def build_aux_target(remain_info):
+    return np.array(
+        [
+            float(np.clip(remain_info.get("danger_score", 0.0), 0.0, 1.0)),
+            float(np.clip(remain_info.get("best_route_score", 0.0), 0.0, 1.0)),
+            float(np.clip(remain_info.get("treasure_priority", 0.0), 0.0, 1.0)),
+        ],
+        dtype=np.float32,
+    )
 
 
 class CurriculumTracker:
@@ -315,6 +353,8 @@ class EpisodeRunner:
 
                 # Step reward / 每步即时奖励
                 reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
+                value_head_reward = build_value_head_reward(_remain_info, reward)
+                aux_target = build_aux_target(_remain_info)
                 total_reward += float(reward[0])
                 terminal_phase = _remain_info.get("phase_name", terminal_phase)
                 phase_step_counts[terminal_phase] += 1
@@ -334,6 +374,9 @@ class EpisodeRunner:
                     "max_flash_dir_score",
                     "action_prior_max",
                     "action_prior_sum",
+                    "best_route_score",
+                    "safe_area_ratio",
+                    "treasure_priority",
                 ):
                     risk_metric_sum[key] += float(_remain_info.get(key, 0.0))
                 for key in (
@@ -352,6 +395,8 @@ class EpisodeRunner:
 
                 # Terminal reward / 终局奖励
                 final_reward = np.zeros(1, dtype=np.float32)
+                terminal_survival_reward = 0.0
+                terminal_loot_reward = 0.0
                 if done:
                     env_info = env_obs["observation"]["env_info"]
                     max_step = int(
@@ -367,17 +412,21 @@ class EpisodeRunner:
 
                     if terminated:
                         early_death_extra = 2.0 * max(0.0, 0.60 - step_ratio) / 0.60
-                        final_reward[0] = -(4.0 + early_death_extra)
+                        terminal_survival_reward = -(4.0 + early_death_extra)
                         result_str = "FAIL"
                     else:
-                        final_reward[0] = 3.0
+                        terminal_survival_reward = 3.0
                         result_str = "WIN"
+                    terminal_loot_reward = 0.45 * float(treasures_collected) + 0.10 * float(collected_buff)
+                    final_reward[0] = terminal_survival_reward + terminal_loot_reward
 
                     self.logger.info(
                         f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
                         f"result:{result_str} sim_score:{total_score:.1f} "
                         f"treasures:{treasures_collected} buffs_collected:{collected_buff} "
                         f"total_reward:{total_reward:.3f} final_reward:{final_reward[0]:.2f} "
+                        f"terminal_survival_reward:{terminal_survival_reward:.2f} "
+                        f"terminal_loot_reward:{terminal_loot_reward:.2f} "
                         f"terminal_phase:{terminal_phase} "
                         f"curriculum_stage:{curriculum_stage}"
                     )
@@ -468,9 +517,14 @@ class EpisodeRunner:
                     reward=reward,
                     done=np.array([float(done)], dtype=np.float32),
                     reward_sum=np.zeros(1, dtype=np.float32),
+                    value_head_reward=value_head_reward,
+                    value_head_sum=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
                     value=np.array(act_data.value, dtype=np.float32).flatten()[:1],
                     next_value=np.zeros(1, dtype=np.float32),
+                    value_heads=np.array(act_data.value_heads, dtype=np.float32).flatten()[: Config.VALUE_HEAD_NUM],
+                    next_value_heads=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
                     advantage=np.zeros(1, dtype=np.float32),
+                    aux_target=aux_target,
                     prob=np.array(act_data.prob, dtype=np.float32),
                     action_prior=np.array(obs_data.action_prior, dtype=np.float32),
                 )
@@ -480,6 +534,9 @@ class EpisodeRunner:
                 if done:
                     if collector:
                         collector[-1].reward = collector[-1].reward + final_reward
+                        collector[-1].value_head_reward[Config.VALUE_HEAD_TOTAL] += float(final_reward[0])
+                        collector[-1].value_head_reward[Config.VALUE_HEAD_SURVIVAL] += float(terminal_survival_reward)
+                        collector[-1].value_head_reward[Config.VALUE_HEAD_LOOT] += float(terminal_loot_reward)
 
                     # Monitor report / 监控上报
                     now = time.time()

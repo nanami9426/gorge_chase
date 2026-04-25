@@ -45,8 +45,9 @@ CRITICAL_FLASH_KEEP_TOPK = 2
 CRITICAL_FLASH_MIN_SCORE = 0.50
 ACTION_PRIOR_DANGER_START = 0.35
 ACTION_PRIOR_BAD_TERRAIN_START = 0.35
-ACTION_PRIOR_SAFE_TREASURE_DANGER = 0.30
-ACTION_PRIOR_SAFE_TREASURE_READINESS = 0.62
+ACTION_PRIOR_SAFE_TREASURE_DANGER = 0.58
+ACTION_PRIOR_SAFE_TREASURE_READINESS = 0.45
+ACTION_PRIOR_CRITICAL_LOOT_DANGER = 0.88
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -256,6 +257,9 @@ class Preprocessor:
             else np.zeros(8, dtype=np.float32)
         )
         buff_remaining_time = float((hero or {}).get("buff_remaining_time", 0.0))
+        priority_has_target = len(treasure_priority_feat) >= 6 and float(treasure_priority_feat[0]) > 0.0
+        priority_weight = float(np.clip(treasure_priority_feat[4], 0.0, 1.0)) if priority_has_target else 0.0
+        priority_safe = priority_has_target and float(treasure_priority_feat[5]) > 0.0
 
         if float(buff_feat[0]) > 0.0:
             buff_dist = float(np.clip(buff_feat[1], 0.0, 1.0))
@@ -270,6 +274,8 @@ class Preprocessor:
                     1.0,
                 )
             )
+            if priority_weight >= 0.55 and danger_score <= ACTION_PRIOR_SAFE_TREASURE_DANGER:
+                buff_need *= 0.45
             self.add_direction_prior(
                 action_prior=action_prior,
                 target_feat=buff_feat,
@@ -282,12 +288,10 @@ class Preprocessor:
             and readiness_score >= ACTION_PRIOR_SAFE_TREASURE_READINESS
             and dead_end_risk <= 0.35
         )
-        if safe_treasure and float(treasure_feat[0]) > 0.0:
-            priority_has_target = len(treasure_priority_feat) >= 6 and float(treasure_priority_feat[0]) > 0.0
-            priority_safe = priority_has_target and float(treasure_priority_feat[5]) > 0.0
+        critical_escape = danger_score >= ACTION_PRIOR_CRITICAL_LOOT_DANGER and escape_need >= 0.65
+        if float(treasure_feat[0]) > 0.0 and not critical_escape:
             target_feat = treasure_feat
-            priority_weight = 0.0
-            if priority_safe:
+            if priority_has_target:
                 target_feat = np.array(
                     [
                         treasure_priority_feat[0],
@@ -297,12 +301,28 @@ class Preprocessor:
                     ],
                     dtype=np.float32,
                 )
-                priority_weight = float(treasure_priority_feat[4])
             treasure_dist = float(np.clip(target_feat[1], 0.0, 1.0))
+            target_action_idx = self.dir_vector_to_action_idx(target_feat[2], target_feat[3])
+            route_alignment = 0.0
+            if target_action_idx is not None and 0 <= target_action_idx < len(terrain_stats["escape_dir_scores"]):
+                route_alignment = float(np.clip(terrain_stats["escape_dir_scores"][target_action_idx], 0.0, 1.0))
+            loot_weight = float(
+                np.clip(
+                    0.30
+                    + 0.65 * priority_weight
+                    + 0.25 * (1.0 - 0.45 * treasure_dist)
+                    + 0.20 * route_alignment
+                    - 0.35 * escape_need,
+                    0.0,
+                    1.0,
+                )
+            )
+            if priority_safe or safe_treasure:
+                loot_weight = max(loot_weight, 0.60 + 0.30 * priority_weight)
             self.add_direction_prior(
                 action_prior=action_prior,
                 target_feat=target_feat,
-                weight=max(0.45 * (1.0 - 0.45 * treasure_dist), 0.55 * priority_weight),
+                weight=loot_weight,
                 legal_action=legal_action,
             )
 
@@ -525,6 +545,9 @@ class Preprocessor:
             "readiness_score": float(terrain_stats["readiness_score"]),
             "dead_end_risk": float(terrain_stats["dead_end_risk"]),
             "route_diversity": float(terrain_stats["route_diversity"]),
+            "best_route_score": float(terrain_stats["best_route_score"]),
+            "safe_area_ratio": float(terrain_stats["safe_area_ratio"]),
+            "route_score_gap": float(terrain_stats["route_score_gap"]),
             "wall_pressure": float(terrain_stats["wall_pressure"]),
             "corner_pressure": float(terrain_stats["corner_pressure"]),
             "risk_pruned_moves": int(risk_pruned_moves),
@@ -533,6 +556,8 @@ class Preprocessor:
             "action_prior": list(action_prior),
             "action_prior_max": float(np.max(action_prior)),
             "action_prior_sum": float(np.sum(action_prior)),
+            "treasure_priority": float(treasure_priority_feat[4]),
+            "safe_to_loot": float(treasure_priority_feat[5]),
             "explore_new_grid": int(explore_reward_info["explore_new_grid"]),
             "frontier_bonus": float(explore_reward_info["frontier_bonus"]),
             "explore_streak_bonus": float(explore_reward_info["explore_streak_bonus"]),
