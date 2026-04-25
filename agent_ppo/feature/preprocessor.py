@@ -206,6 +206,7 @@ class Preprocessor:
         hero,
         danger_score,
         max_monster_speed,
+        treasure_priority_feat=None,
     ):
         legal_action = list(legal_action)
         action_prior = np.zeros(16, dtype=np.float32)
@@ -249,6 +250,11 @@ class Preprocessor:
         organs_feat = np.asarray(organs_feat, dtype=np.float32)
         treasure_feat = organs_feat[:4]
         buff_feat = organs_feat[4:8]
+        treasure_priority_feat = (
+            np.asarray(treasure_priority_feat, dtype=np.float32)
+            if treasure_priority_feat is not None
+            else np.zeros(8, dtype=np.float32)
+        )
         buff_remaining_time = float((hero or {}).get("buff_remaining_time", 0.0))
 
         if float(buff_feat[0]) > 0.0:
@@ -277,11 +283,26 @@ class Preprocessor:
             and dead_end_risk <= 0.35
         )
         if safe_treasure and float(treasure_feat[0]) > 0.0:
-            treasure_dist = float(np.clip(treasure_feat[1], 0.0, 1.0))
+            priority_has_target = len(treasure_priority_feat) >= 6 and float(treasure_priority_feat[0]) > 0.0
+            priority_safe = priority_has_target and float(treasure_priority_feat[5]) > 0.0
+            target_feat = treasure_feat
+            priority_weight = 0.0
+            if priority_safe:
+                target_feat = np.array(
+                    [
+                        treasure_priority_feat[0],
+                        treasure_priority_feat[1],
+                        treasure_priority_feat[2],
+                        treasure_priority_feat[3],
+                    ],
+                    dtype=np.float32,
+                )
+                priority_weight = float(treasure_priority_feat[4])
+            treasure_dist = float(np.clip(target_feat[1], 0.0, 1.0))
             self.add_direction_prior(
                 action_prior=action_prior,
-                target_feat=treasure_feat,
-                weight=0.45 * (1.0 - 0.45 * treasure_dist),
+                target_feat=target_feat,
+                weight=max(0.45 * (1.0 - 0.45 * treasure_dist), 0.55 * priority_weight),
                 legal_action=legal_action,
             )
 
@@ -329,6 +350,10 @@ class Preprocessor:
             max_monster_speed=max_monster_speed,
         )
         nearest_monster_vec = self.monster_processor.get_nearest_monster_vector(monster_feats)
+        monster_prediction_feat, future_monster_positions = self.monster_processor.get_prediction_info(
+            monsters=monsters,
+            hero_pos=hero_pos,
+        )
 
         # OrganState[] 物件状态列表（宝箱、buff）
         organs = frame_state.get("organs", [])
@@ -364,6 +389,8 @@ class Preprocessor:
             move_mask=move_mask,
             monster_vec=nearest_monster_vec,
             legal_action=legal_action,
+            hero_pos=hero_pos,
+            future_monster_positions=future_monster_positions,
         )
         legal_action, risk_pruned_moves = self.prune_risky_moves(
             legal_action=legal_action,
@@ -374,6 +401,13 @@ class Preprocessor:
             monster_feats=monster_feats,
             terrain_stats=terrain_stats,
         )
+        treasure_priority_feat = self.organ_processor.get_priority_feats(
+            organs=organs,
+            hero_pos=hero_pos,
+            terrain_stats=terrain_stats,
+            danger_score=danger_score,
+        )
+        memory_feat = self.explore_processor.get_memory_feats(hero_pos=hero_pos)
         legal_action, critical_pruned_actions = self.prune_critical_escape_actions(
             legal_action=legal_action,
             terrain_stats=terrain_stats,
@@ -393,6 +427,7 @@ class Preprocessor:
             hero=hero,
             danger_score=danger_score,
             max_monster_speed=max_monster_speed,
+            treasure_priority_feat=treasure_priority_feat,
         )
 
         # Progress features (2D) / 进度特征
@@ -405,8 +440,11 @@ class Preprocessor:
                 hero_feat,
                 monster_feats[0],
                 monster_feats[1],
+                monster_prediction_feat,
                 organs_feat,
+                treasure_priority_feat,
                 explore_feat,
+                memory_feat,
                 terrain_feat,
                 np.array(legal_action, dtype=np.float32),
                 progress_feat,

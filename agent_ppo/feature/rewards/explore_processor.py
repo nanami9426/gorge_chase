@@ -24,6 +24,18 @@ LOCAL_LOOP_PENALTY_CAP = 0.14
 RECENT_GRID_WINDOW = 15
 VISIT_COUNT_NORM_CAP = 6.0
 NO_PROGRESS_NORM_CAP = 20.0
+MEMORY_EMA_ALPHA = 0.15
+
+SAFE_MEMORY_DIRS = [
+    (1, 0),
+    (1, 1),
+    (0, 1),
+    (-1, 1),
+    (-1, 0),
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+]
 
 
 class ExploreProcessor:
@@ -39,6 +51,7 @@ class ExploreProcessor:
         self.no_progress_steps = 0
         self.explore_streak_steps = 0
         self.recent_grids = deque(maxlen=RECENT_GRID_WINDOW)
+        self.danger_grid_ema = {}
 
     def get_grid(self, hero_pos):
         return (int(hero_pos["x"]) // self.grid_size, int(hero_pos["z"]) // self.grid_size)
@@ -97,6 +110,57 @@ class ExploreProcessor:
             ],
             dtype=np.float32,
         )
+
+    def get_memory_feats(self, hero_pos):
+        grid = self.get_grid(hero_pos)
+        current_danger = float(self.danger_grid_ema.get(grid, 0.0))
+        best_safe_score = 0.0
+        best_dir = (0.0, 0.0)
+        known_neighbors = 0
+        safe_neighbors = 0
+        grid_x, grid_z = grid
+
+        for dir_x, dir_z in SAFE_MEMORY_DIRS:
+            next_grid = (grid_x + dir_x, grid_z + dir_z)
+            if not (0 <= next_grid[0] <= self.max_grid_index and 0 <= next_grid[1] <= self.max_grid_index):
+                continue
+            if next_grid in self.danger_grid_ema:
+                known_neighbors += 1
+            danger_memory = float(self.danger_grid_ema.get(next_grid, 0.25))
+            safe_score = float(np.clip(1.0 - danger_memory, 0.0, 1.0))
+            if safe_score >= 0.65:
+                safe_neighbors += 1
+            if safe_score > best_safe_score:
+                best_safe_score = safe_score
+                best_dir = (float(dir_x), float(dir_z))
+
+        local_safe_ratio = float(safe_neighbors / max(1, len(SAFE_MEMORY_DIRS)))
+        memory_confidence = float(np.clip(known_neighbors / max(1, len(SAFE_MEMORY_DIRS)), 0.0, 1.0))
+        return np.array(
+            [
+                current_danger,
+                best_safe_score,
+                best_dir[0],
+                best_dir[1],
+                local_safe_ratio * memory_confidence,
+            ],
+            dtype=np.float32,
+        )
+
+    def update_safety_memory(self, grid, danger_score, terrain_stats=None):
+        terrain_stats = terrain_stats or {}
+        danger_score = float(np.clip(danger_score, 0.0, 1.0))
+        dead_end_risk = float(np.clip(terrain_stats.get("dead_end_risk", 0.0), 0.0, 1.0))
+        readiness_score = float(np.clip(terrain_stats.get("readiness_score", 1.0), 0.0, 1.0))
+        danger_signal = float(
+            np.clip(
+                0.55 * danger_score + 0.25 * dead_end_risk + 0.20 * (1.0 - readiness_score),
+                0.0,
+                1.0,
+            )
+        )
+        old_signal = float(self.danger_grid_ema.get(grid, danger_signal))
+        self.danger_grid_ema[grid] = (1.0 - MEMORY_EMA_ALPHA) * old_signal + MEMORY_EMA_ALPHA * danger_signal
 
     def calc_revisit_adjustment(self, grid, explore_new_grid, visit_count_after):
         if explore_new_grid:
@@ -183,6 +247,7 @@ class ExploreProcessor:
         )
 
         self.visited_grid_counts[grid] = context["visit_count_after"]
+        self.update_safety_memory(grid=grid, danger_score=danger_score, terrain_stats=terrain_stats)
         self.no_progress_steps = context["no_progress_steps"]
         self.explore_streak_steps = explore_streak_steps
         self.last_hero_pos = cur_pos

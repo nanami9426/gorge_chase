@@ -534,6 +534,89 @@ class RecurrentPPOTests(unittest.TestCase):
 
         self.assertGreater(danger_weight, safe_weight)
 
+    def test_monster_prediction_detects_approach_pressure(self):
+        processor = MonsterProcessor()
+        hero_pos = {"x": 0, "z": 0}
+        first_frame = [
+            {
+                "monster_id": 1,
+                "is_in_view": 1,
+                "hero_relative_direction": 1,
+                "speed": 2,
+                "pos": {"x": 20, "z": 0},
+            }
+        ]
+        second_frame = [
+            {
+                "monster_id": 1,
+                "is_in_view": 1,
+                "hero_relative_direction": 1,
+                "speed": 2,
+                "pos": {"x": 18, "z": 0},
+            }
+        ]
+
+        processor.get_prediction_info(first_frame, hero_pos)
+        prediction_feat, future_positions = processor.get_prediction_info(second_frame, hero_pos)
+
+        self.assertEqual(prediction_feat.shape, (6,))
+        self.assertGreater(float(prediction_feat[0]), 0.0)
+        self.assertGreater(float(prediction_feat[1]), 0.0)
+        self.assertGreater(float(prediction_feat[2]), float(prediction_feat[4]))
+        self.assertGreaterEqual(float(prediction_feat[5]), float(prediction_feat[2]))
+        self.assertIn(20, future_positions)
+
+    def test_route_plan_penalizes_monster_covered_side(self):
+        processor = TerrainProcessor()
+        map_info = np.ones((21, 21), dtype=np.int32).tolist()
+        hero_pos = {"x": 10, "z": 10}
+        route_plan = processor.calc_route_plan_scores(
+            map_info=map_info,
+            move_mask=[1] * 8,
+            legal_action=[1] * Config.ACTION_NUM,
+            hero_pos=hero_pos,
+            future_monster_positions={5: [{"x": 14, "z": 10}]},
+        )
+
+        self.assertGreater(route_plan["move_route_scores"][4], route_plan["move_route_scores"][0])
+        self.assertGreater(route_plan["best_route_score"], 0.0)
+        self.assertGreater(route_plan["safe_area_ratio"], 0.0)
+
+    def test_treasure_priority_damps_under_high_danger(self):
+        processor = OrganProcessor()
+        hero_pos = {"x": 0, "z": 0}
+        organs = [
+            {
+                "status": 1,
+                "sub_type": 1,
+                "config_id": 1,
+                "hero_relative_direction": 1,
+                "pos": {"x": 8, "z": 0},
+            }
+        ]
+        terrain_stats = {"readiness_score": 0.8, "dead_end_risk": 0.1, "trap_risk": 0.1}
+
+        safe_feat = processor.get_priority_feats(organs, hero_pos, terrain_stats=terrain_stats, danger_score=0.1)
+        danger_feat = processor.get_priority_feats(organs, hero_pos, terrain_stats=terrain_stats, danger_score=0.9)
+
+        self.assertEqual(safe_feat.shape, (8,))
+        self.assertGreater(float(safe_feat[4]), float(danger_feat[4]))
+        self.assertGreater(float(safe_feat[5]), float(danger_feat[5]))
+
+    def test_memory_features_point_to_known_safe_neighbor(self):
+        processor = ExploreProcessor()
+        hero_pos = {"x": 16, "z": 16}
+        grid = processor.get_grid(hero_pos)
+        processor.danger_grid_ema[(grid[0] + 1, grid[1])] = 0.05
+        processor.danger_grid_ema[(grid[0] - 1, grid[1])] = 0.95
+
+        memory_feat = processor.get_memory_feats(hero_pos)
+
+        self.assertEqual(memory_feat.shape, (5,))
+        self.assertGreater(float(memory_feat[1]), 0.9)
+        self.assertEqual(float(memory_feat[2]), 1.0)
+        self.assertEqual(float(memory_feat[3]), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

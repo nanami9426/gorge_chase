@@ -19,6 +19,7 @@ TREASURE_DANGER_DAMP_END = 0.75
 SAFE_TREASURE_DANGER_THRESHOLD = 0.35
 SAFE_TREASURE_READINESS_THRESHOLD = 0.62
 SAFE_TREASURE_APPROACH_BONUS = 0.35
+MAX_TREASURE_COUNT = 10.0
 SQRT_HALF = float(np.sqrt(0.5))
 
 DIRECTION_TO_VECTOR = {
@@ -119,6 +120,61 @@ class OrganProcessor:
         return np.array(
             # has_target, dist_norm, dir_x, dir_z
             [1.0, organ_info["dist_norm"], organ_info["dir_x"], organ_info["dir_z"]],
+            dtype=np.float32,
+        )
+
+    def score_treasure_priority(self, treasure, terrain_stats=None, danger_score=0.0):
+        terrain_stats = terrain_stats or {}
+        dist_score = 1.0 - float(np.clip(treasure["dist_norm"], 0.0, 1.0))
+        readiness_score = float(np.clip(terrain_stats.get("readiness_score", 0.5), 0.0, 1.0))
+        dead_end_risk = float(np.clip(terrain_stats.get("dead_end_risk", 0.0), 0.0, 1.0))
+        trap_risk = float(np.clip(terrain_stats.get("trap_risk", 0.0), 0.0, 1.0))
+        danger_score = float(np.clip(danger_score, 0.0, 1.0))
+        safety_score = float(np.clip(0.55 * readiness_score + 0.25 * (1.0 - dead_end_risk) + 0.20 * (1.0 - trap_risk), 0.0, 1.0))
+        loot_window = self.calc_treasure_approach_weight(danger_score)
+        priority = float(
+            np.clip(
+                0.55 * dist_score
+                + 0.30 * safety_score
+                + 0.15 * loot_window
+                - 0.35 * danger_score
+                - 0.20 * dead_end_risk,
+                0.0,
+                1.0,
+            )
+        )
+        return priority
+
+    def get_priority_feats(self, organs, hero_pos, terrain_stats=None, danger_score=0.0):
+        available_organs = self.build_available_organs(organs, hero_pos)
+        treasures = [organ for organ in available_organs if int(organ["sub_type"]) == 1]
+        if not treasures:
+            return np.zeros(8, dtype=np.float32)
+
+        scored_treasures = [
+            (self.score_treasure_priority(treasure, terrain_stats=terrain_stats, danger_score=danger_score), treasure)
+            for treasure in treasures
+        ]
+        scored_treasures.sort(key=lambda item: item[0], reverse=True)
+        best_priority, best_treasure = scored_treasures[0]
+        nearest_treasure = min(treasures, key=lambda treasure: treasure["dist_norm"])
+        nearest_priority = self.score_treasure_priority(
+            nearest_treasure,
+            terrain_stats=terrain_stats,
+            danger_score=danger_score,
+        )
+        safe_to_loot = float(best_priority >= 0.45 and float(danger_score) <= TREASURE_DANGER_DAMP_END)
+        return np.array(
+            [
+                1.0,
+                best_treasure["dist_norm"],
+                best_treasure["dir_x"],
+                best_treasure["dir_z"],
+                best_priority,
+                safe_to_loot,
+                float(np.clip(best_priority - nearest_priority + 0.5, 0.0, 1.0)),
+                float(np.clip(len(treasures) / MAX_TREASURE_COUNT, 0.0, 1.0)),
+            ],
             dtype=np.float32,
         )
 

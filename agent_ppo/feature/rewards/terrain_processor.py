@@ -4,6 +4,10 @@ import numpy as np
 MOVE_ACTION_NUM = 8
 MAX_CLEARANCE_STEPS = 4.0
 FLASH_LOOKAHEAD_STEPS = (3, 4, 5)
+ROUTE_PLAN_MAX_DEPTH = 10
+ROUTE_REACHABLE_NORM = 64.0
+MONSTER_SAFE_CELL_RADIUS = 2.5
+MONSTER_CLEARANCE_NORM = 8.0
 SQRT_HALF = float(np.sqrt(0.5))
 OPEN_FIELD_TARGET = 0.65
 # 开阔度相较上一帧提升时的奖励系数
@@ -295,6 +299,175 @@ class TerrainProcessor:
         flash_options = sum(1 for score in flash_dir_scores if float(score) >= 0.65)
         return float(np.clip((move_options + 0.5 * flash_options) / float(MOVE_ACTION_NUM), 0.0, 1.0))
 
+    def project_world_pos_to_local_cell(self, world_pos, hero_pos, map_info):
+        if (
+            world_pos is None
+            or hero_pos is None
+            or map_info is None
+            or not map_info
+            or not map_info[0]
+            or "x" not in world_pos
+            or "z" not in world_pos
+        ):
+            return None
+
+        center_row = len(map_info) // 2
+        center_col = len(map_info[0]) // 2
+        dx = int(round(float(world_pos["x"]) - float(hero_pos["x"])))
+        dz = int(round(float(world_pos["z"]) - float(hero_pos["z"])))
+        row = center_row - dz
+        col = center_col + dx
+        if not (0 <= row < len(map_info) and 0 <= col < len(map_info[0])):
+            return None
+        return row, col
+
+    def build_future_monster_cells(self, future_monster_positions, hero_pos, map_info):
+        monster_cells = []
+        for positions in (future_monster_positions or {}).values():
+            for pos in positions:
+                cell = self.project_world_pos_to_local_cell(pos, hero_pos, map_info)
+                if cell is not None:
+                    monster_cells.append(cell)
+        return monster_cells
+
+    def calc_monster_clearance(self, row, col, monster_cells) -> float:
+        if not monster_cells:
+            return 1.0
+        min_dist = min(float(np.sqrt((row - mr) ** 2 + (col - mc) ** 2)) for mr, mc in monster_cells)
+        return float(np.clip(min_dist / MONSTER_CLEARANCE_NORM, 0.0, 1.0))
+
+    def calc_reachable_route_stats(self, map_info, start_row, start_col, monster_cells=None):
+        if not self.is_cell_passable(map_info, start_row, start_col):
+            return {
+                "score": 0.0,
+                "reachable_ratio": 0.0,
+                "safe_ratio": 0.0,
+                "monster_clearance": 0.0,
+            }
+
+        visited = {(start_row, start_col)}
+        queue = [(start_row, start_col, 0)]
+        head = 0
+        while head < len(queue):
+            row, col, depth = queue[head]
+            head += 1
+            if depth >= ROUTE_PLAN_MAX_DEPTH:
+                continue
+            for dr, dc in MOVE_DIRS:
+                next_row = row + dr
+                next_col = col + dc
+                next_cell = (next_row, next_col)
+                if next_cell in visited or not self.is_cell_passable(map_info, next_row, next_col):
+                    continue
+                visited.add(next_cell)
+                queue.append((next_row, next_col, depth + 1))
+
+        clearances = [self.calc_monster_clearance(row, col, monster_cells or []) for row, col in visited]
+        safe_ratio = (
+            float(np.mean([clearance >= MONSTER_SAFE_CELL_RADIUS / MONSTER_CLEARANCE_NORM for clearance in clearances]))
+            if clearances
+            else 0.0
+        )
+        monster_clearance = float(np.mean(clearances)) if clearances else 0.0
+        reachable_ratio = float(np.clip(len(visited) / ROUTE_REACHABLE_NORM, 0.0, 1.0))
+        landing_open = self.calc_landing_openness(map_info, start_row, start_col)
+        score = float(
+            np.clip(
+                0.40 * reachable_ratio
+                + 0.25 * landing_open
+                + 0.20 * safe_ratio
+                + 0.15 * monster_clearance,
+                0.0,
+                1.0,
+            )
+        )
+        return {
+            "score": score,
+            "reachable_ratio": reachable_ratio,
+            "safe_ratio": float(safe_ratio),
+            "monster_clearance": monster_clearance,
+        }
+
+    def get_move_landing_cell(self, map_info, action_idx):
+        if map_info is None or not map_info or not map_info[0]:
+            return None
+        center_row = len(map_info) // 2
+        center_col = len(map_info[0]) // 2
+        dr, dc = MOVE_DIRS[action_idx]
+        row = center_row + dr
+        col = center_col + dc
+        if not self.is_cell_passable(map_info, row, col):
+            return None
+        return row, col
+
+    def get_flash_landing_cell(self, map_info, action_idx):
+        if map_info is None or not map_info or not map_info[0]:
+            return None
+        center_row = len(map_info) // 2
+        center_col = len(map_info[0]) // 2
+        dr, dc = MOVE_DIRS[action_idx]
+        max_dist = 10 if action_idx % 2 == 0 else 8
+        for dist in range(max_dist, 0, -1):
+            row = center_row + dr * dist
+            col = center_col + dc * dist
+            if self.is_cell_passable(map_info, row, col):
+                return row, col
+        return None
+
+    def calc_route_plan_scores(self, map_info, move_mask, legal_action=None, hero_pos=None, future_monster_positions=None):
+        legal_action = list(legal_action) if legal_action is not None else [1] * (MOVE_ACTION_NUM * 2)
+        move_mask = list(move_mask[:MOVE_ACTION_NUM]) if move_mask is not None else [1] * MOVE_ACTION_NUM
+        monster_cells = self.build_future_monster_cells(future_monster_positions, hero_pos, map_info)
+
+        move_route_scores = []
+        for action_idx in range(MOVE_ACTION_NUM):
+            if action_idx >= len(legal_action) or legal_action[action_idx] == 0 or move_mask[action_idx] == 0:
+                move_route_scores.append(0.0)
+                continue
+            landing = self.get_move_landing_cell(map_info, action_idx)
+            if landing is None:
+                move_route_scores.append(0.0)
+                continue
+            move_route_scores.append(
+                self.calc_reachable_route_stats(map_info, landing[0], landing[1], monster_cells)["score"]
+            )
+
+        flash_route_scores = []
+        for action_idx in range(MOVE_ACTION_NUM):
+            full_action_idx = action_idx + MOVE_ACTION_NUM
+            if full_action_idx >= len(legal_action) or legal_action[full_action_idx] == 0:
+                flash_route_scores.append(0.0)
+                continue
+            landing = self.get_flash_landing_cell(map_info, action_idx)
+            if landing is None:
+                flash_route_scores.append(0.0)
+                continue
+            flash_route_scores.append(
+                self.calc_reachable_route_stats(map_info, landing[0], landing[1], monster_cells)["score"]
+            )
+
+        if map_info is None or not map_info or not map_info[0]:
+            current_stats = {"safe_ratio": 1.0, "score": 1.0}
+        else:
+            current_stats = self.calc_reachable_route_stats(
+                map_info,
+                len(map_info) // 2,
+                len(map_info[0]) // 2,
+                monster_cells,
+            )
+
+        all_scores = move_route_scores + flash_route_scores
+        best_route_score = float(max(all_scores, default=0.0))
+        mean_route_score = float(np.mean(all_scores)) if all_scores else 0.0
+        return {
+            "move_route_scores": move_route_scores,
+            "flash_route_scores": flash_route_scores,
+            "best_route_score": best_route_score,
+            "mean_route_score": mean_route_score,
+            "safe_area_ratio": float(current_stats["safe_ratio"]),
+            "route_score_gap": float(max(0.0, best_route_score - mean_route_score)),
+        }
+
     def calc_readiness_score(
         self,
         openness,
@@ -327,7 +500,7 @@ class TerrainProcessor:
         )
         return float(np.clip(dead_end_risk, 0.0, 1.0))
 
-    def extract_stats(self, map_info, move_mask, monster_vec=None, legal_action=None):
+    def extract_stats(self, map_info, move_mask, monster_vec=None, legal_action=None, hero_pos=None, future_monster_positions=None):
         openness = self.calc_openness_ratio(map_info)
         escape_ratio = (
             float(sum(move_mask[:MOVE_ACTION_NUM])) / float(MOVE_ACTION_NUM)
@@ -344,13 +517,28 @@ class TerrainProcessor:
             wall_pressure=wall_pressure,
             corner_pressure=corner_pressure,
         )
-        escape_dir_scores = self.calc_escape_dir_scores(clearances, move_mask, monster_vec)
-        flash_dir_scores = self.calc_flash_dir_scores(
+        base_escape_dir_scores = self.calc_escape_dir_scores(clearances, move_mask, monster_vec)
+        base_flash_dir_scores = self.calc_flash_dir_scores(
             map_info=map_info,
             legal_action=legal_action,
             clearances=clearances,
             monster_vec=monster_vec,
         )
+        route_plan = self.calc_route_plan_scores(
+            map_info=map_info,
+            move_mask=move_mask,
+            legal_action=legal_action,
+            hero_pos=hero_pos,
+            future_monster_positions=future_monster_positions,
+        )
+        escape_dir_scores = [
+            float(np.clip(0.60 * base_score + 0.40 * route_score, 0.0, 1.0))
+            for base_score, route_score in zip(base_escape_dir_scores, route_plan["move_route_scores"])
+        ]
+        flash_dir_scores = [
+            float(np.clip(0.60 * base_score + 0.40 * route_score, 0.0, 1.0))
+            for base_score, route_score in zip(base_flash_dir_scores, route_plan["flash_route_scores"])
+        ]
         route_diversity = self.calc_route_diversity(
             escape_dir_scores=escape_dir_scores,
             flash_dir_scores=flash_dir_scores,
@@ -380,9 +568,15 @@ class TerrainProcessor:
             "dead_end_risk": dead_end_risk,
             "route_diversity": route_diversity,
             "best_flash_score": max(flash_dir_scores) if flash_dir_scores else 0.0,
+            "best_route_score": route_plan["best_route_score"],
+            "mean_route_score": route_plan["mean_route_score"],
+            "safe_area_ratio": route_plan["safe_area_ratio"],
+            "route_score_gap": route_plan["route_score_gap"],
             "clearances": clearances,
             "escape_dir_scores": escape_dir_scores,
             "flash_dir_scores": flash_dir_scores,
+            "move_route_scores": route_plan["move_route_scores"],
+            "flash_route_scores": route_plan["flash_route_scores"],
         }
 
     def get_feats(self, terrain_stats):
@@ -398,6 +592,10 @@ class TerrainProcessor:
                 terrain_stats["dead_end_risk"],
                 terrain_stats["route_diversity"],
                 terrain_stats["best_flash_score"],
+                terrain_stats["best_route_score"],
+                terrain_stats["mean_route_score"],
+                terrain_stats["safe_area_ratio"],
+                terrain_stats["route_score_gap"],
                 *terrain_stats["escape_dir_scores"],
                 *terrain_stats["flash_dir_scores"],
             ],
