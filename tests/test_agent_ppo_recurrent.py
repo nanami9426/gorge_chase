@@ -335,26 +335,45 @@ class RecurrentPPOTests(unittest.TestCase):
         self.assertGreater(weighted_reward_breakdown["monster_dist_reward"], 0.0)
         self.assertGreater(combined_weights["terrain_reward"], 1.0)
 
-    def test_curriculum_tracker_promotes_after_stable_midgame(self):
+    def test_curriculum_tracker_does_not_promote_on_600_step_failures(self):
         tracker = CurriculumTracker()
 
         promoted = False
-        episodes_until_promotion = SURVIVAL_PROMOTION_WINDOW + SURVIVAL_PROMOTION_STREAK - 1
-        for idx in range(episodes_until_promotion):
+        for _ in range(SURVIVAL_PROMOTION_WINDOW + SURVIVAL_PROMOTION_STREAK + 5):
             metrics, promoted = tracker.record_episode(
                 episode_steps=600,
                 survived=False,
                 reached_phase_2=False,
                 max_step=1000,
             )
+
+        self.assertEqual(tracker.get_stage(), CURRICULUM_SURVIVAL_BOOTSTRAP)
+        self.assertFalse(promoted)
+        self.assertLess(metrics["avg_step_ratio"], 0.78)
+        self.assertEqual(metrics["phase_2_rate"], 0.0)
+
+    def test_curriculum_tracker_promotes_after_stable_lategame_bootstrap(self):
+        tracker = CurriculumTracker()
+
+        promoted = False
+        episodes_until_promotion = SURVIVAL_PROMOTION_WINDOW + SURVIVAL_PROMOTION_STREAK - 1
+        for idx in range(episodes_until_promotion):
+            metrics, promoted = tracker.record_episode(
+                episode_steps=850,
+                survived=False,
+                reached_phase_2=True,
+                max_step=1000,
+                phase_2_steps=150,
+            )
             if idx < episodes_until_promotion - 1:
                 self.assertFalse(promoted)
 
         self.assertEqual(tracker.get_stage(), CURRICULUM_LOOT_UNLOCK)
         self.assertTrue(promoted)
-        self.assertEqual(metrics["promotion_reason"], "stable_midgame")
-        self.assertGreaterEqual(metrics["avg_step_ratio"], 0.55)
-        self.assertGreaterEqual(metrics["midgame_rate"], 0.50)
+        self.assertEqual(metrics["promotion_reason"], "stable_lategame_bootstrap")
+        self.assertGreaterEqual(metrics["avg_step_ratio"], 0.78)
+        self.assertGreaterEqual(metrics["lategame_rate"], 0.50)
+        self.assertGreaterEqual(metrics["phase_2_rate"], 0.50)
 
     def test_curriculum_tracker_stays_in_survival_when_metrics_miss(self):
         tracker = CurriculumTracker()

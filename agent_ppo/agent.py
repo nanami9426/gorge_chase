@@ -172,6 +172,7 @@ class Agent(BaseAgent):
         logits_np = logits_np + float(Config.ACTION_PRIOR_LOGIT_SCALE) * action_prior_np
         prob = self._legal_soft_max(logits_np, legal_action_np)
         prob = self._apply_sampling_floor(prob, legal_action_np)
+        prob = self._mix_action_prior(prob, action_prior_np, legal_action_np)
 
         return logits_np, value_np, prob
 
@@ -239,3 +240,14 @@ class Agent(BaseAgent):
             prior = np.zeros(Config.ACTION_NUM, dtype=np.float32)
         prior = np.clip(prior, 0.0, 1.0) * legal_action
         return prior
+
+    def _mix_action_prior(self, probs, action_prior, legal_action):
+        prior = np.array(action_prior, dtype=np.float32) * np.array(legal_action, dtype=np.float32)
+        prior_sum = float(np.sum(prior))
+        if prior_sum <= 1e-6:
+            return probs
+
+        prior_dist = prior / prior_sum
+        mix_weight = float(Config.ACTION_PRIOR_MIX_MAX) * float(np.clip(np.max(prior), 0.0, 1.0))
+        mixed_prob = (1.0 - mix_weight) * probs + mix_weight * prior_dist
+        return mixed_prob / (np.sum(mixed_prob, keepdims=True) * 1.00001)

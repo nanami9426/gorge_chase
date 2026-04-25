@@ -207,7 +207,8 @@ class Algorithm:
         label = label * legal_action
         label = label + 1e5 * (legal_action - 1)
         prob_dist = torch.nn.functional.softmax(label, dim=1)
-        return self._apply_sampling_floor(prob_dist, legal_action)
+        prob_dist = self._apply_sampling_floor(prob_dist, legal_action)
+        return self._mix_action_prior(prob_dist, action_prior, legal_action)
 
     def _apply_sampling_floor(self, prob_dist, legal_action):
         floor = float(Config.SAMPLING_PROB_FLOOR)
@@ -217,4 +218,22 @@ class Algorithm:
         legal_count = legal_action.sum(dim=1, keepdim=True).clamp(min=1.0)
         uniform_prob = legal_action / legal_count
         mixed_prob = (1.0 - floor) * prob_dist + floor * uniform_prob
+        return mixed_prob / mixed_prob.sum(dim=1, keepdim=True).clamp(min=1e-9)
+
+    def _mix_action_prior(self, prob_dist, action_prior, legal_action):
+        if action_prior is None:
+            return prob_dist
+
+        prior = torch.clamp(action_prior, 0.0, 1.0) * legal_action
+        prior_sum = prior.sum(dim=1, keepdim=True)
+        has_prior = prior_sum > 1e-6
+        prior_dist = torch.where(
+            has_prior,
+            prior / prior_sum.clamp(min=1e-9),
+            torch.zeros_like(prior),
+        )
+        max_prior = prior.max(dim=1, keepdim=True).values.clamp(0.0, 1.0)
+        mix_weight = float(Config.ACTION_PRIOR_MIX_MAX) * max_prior
+        mixed_prob = (1.0 - mix_weight) * prob_dist + mix_weight * prior_dist
+        mixed_prob = torch.where(has_prior, mixed_prob, prob_dist)
         return mixed_prob / mixed_prob.sum(dim=1, keepdim=True).clamp(min=1e-9)

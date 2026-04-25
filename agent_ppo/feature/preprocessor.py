@@ -504,6 +504,9 @@ class Preprocessor:
             "buff_priority_weight": float(organ_reward["buff_priority_weight"]),
             "treasure_approach_weight": float(organ_reward["treasure_approach_weight"]),
             "buffs_collected": int(organ_reward["buffs_collected"]),
+            "available_treasure_count": int(organ_reward["available_treasure_count"]),
+            "available_buff_count": int(organ_reward["available_buff_count"]),
+            "nearest_buff_dist_norm": float(organ_reward["nearest_buff_dist_norm"]),
             "reward_breakdown": {
                 "raw": raw_reward_breakdown,
                 "phase_weights": phase_weights,

@@ -25,7 +25,7 @@ from tools.train_env_conf_validate import read_usr_conf
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 
 MODEL_SAVE_INTERVAL = 60 * 10
-SURVIVAL_PROMOTION_WINDOW = 8
+SURVIVAL_PROMOTION_WINDOW = 10
 SURVIVAL_PROMOTION_STREAK = 3
 FULL_PROMOTION_WINDOW = 10
 FULL_PROMOTION_STREAK = 3
@@ -137,13 +137,15 @@ class CurriculumTracker:
         if self.curriculum_stage == CURRICULUM_SURVIVAL_BOOTSTRAP:
             ready = (
                 metrics["window_size"] >= SURVIVAL_PROMOTION_WINDOW
-                and metrics["avg_step_ratio"] >= 0.55
-                and metrics["midgame_rate"] >= 0.50
+                and metrics["avg_step_ratio"] >= 0.78
+                and metrics["lategame_rate"] >= 0.50
+                and metrics["phase_2_rate"] >= 0.50
+                and (metrics["post_speedup_rate"] >= 0.30 or metrics["survival_rate"] >= 0.10)
             )
             self.promotion_streak = self.promotion_streak + 1 if ready else 0
             metrics["promotion_streak"] = self.promotion_streak
             if self.promotion_streak >= SURVIVAL_PROMOTION_STREAK:
-                metrics["promotion_reason"] = "stable_midgame"
+                metrics["promotion_reason"] = "stable_lategame_bootstrap"
                 self._promote(CURRICULUM_LOOT_UNLOCK)
                 promoted = True
         elif self.curriculum_stage == CURRICULUM_LOOT_UNLOCK:
@@ -342,6 +344,9 @@ class EpisodeRunner:
                     "local_loop_penalty",
                     "positioning_need",
                     "buff_priority_weight",
+                    "available_treasure_count",
+                    "available_buff_count",
+                    "nearest_buff_dist_norm",
                 ):
                     behavior_metric_sum[key] += float(_remain_info.get(key, 0.0))
 
@@ -412,6 +417,14 @@ class EpisodeRunner:
                         behavior_metric_sum.get("buff_priority_weight", 0.0) / max(step, 1),
                         4,
                     )
+                    available_buff_count_mean = round(
+                        behavior_metric_sum.get("available_buff_count", 0.0) / max(step, 1),
+                        4,
+                    )
+                    nearest_buff_dist_mean = round(
+                        behavior_metric_sum.get("nearest_buff_dist_norm", 0.0) / max(step, 1),
+                        4,
+                    )
                     self.logger.info(
                         f"[PHASE] episode:{self.episode_cnt} terminal_phase:{terminal_phase} "
                         f"phase_step_counts:{phase_step_counts_log} "
@@ -424,6 +437,8 @@ class EpisodeRunner:
                         f"local_loop_penalty_mean:{local_loop_penalty_mean} "
                         f"positioning_need_mean:{positioning_need_mean} "
                         f"buff_priority_weight_mean:{buff_priority_weight_mean} "
+                        f"available_buff_count_mean:{available_buff_count_mean} "
+                        f"nearest_buff_dist_mean:{nearest_buff_dist_mean} "
                         f"curriculum_stage:{curriculum_stage}"
                     )
                     curriculum_metrics, promoted = self.curriculum_tracker.record_episode(

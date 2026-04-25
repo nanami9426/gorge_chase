@@ -162,6 +162,8 @@ class OrganProcessor:
 
     def calc_reward(self, env_info, organs, hero_pos, hero=None, terrain_stats=None, danger_score=0.0):
         available_organs = self.build_available_organs(organs, hero_pos)
+        available_treasure_count = sum(1 for organ in available_organs if int(organ["sub_type"]) == 1)
+        available_buff_count = sum(1 for organ in available_organs if int(organ["sub_type"]) == 2)
         nearest_treasure = self.select_nearest_organ(available_organs, sub_type=1)
         nearest_buff = self.select_nearest_organ(available_organs, sub_type=2)
         terrain_stats = terrain_stats or {}
@@ -252,4 +254,7 @@ class OrganProcessor:
             "buff_priority_weight": float(buff_priority_weight),
             "treasure_approach_weight": float(treasure_approach_weight),
             "buffs_collected": int(collected_buff),
+            "available_treasure_count": int(available_treasure_count),
+            "available_buff_count": int(available_buff_count),
+            "nearest_buff_dist_norm": float(1.0 if nearest_buff is None else nearest_buff["dist_norm"]),
         }
