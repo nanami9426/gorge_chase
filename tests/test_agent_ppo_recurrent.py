@@ -75,6 +75,33 @@ class RecurrentPPOTests(unittest.TestCase):
             self.assertTrue(np.isfinite(sample.reward_sum).all())
             self.assertTrue(np.isfinite(sample.value_head_sum).all())
 
+    def test_sample_process_bootstraps_truncated_tail(self):
+        rollout = [
+            SampleData(
+                obs=np.zeros(Config.DIM_OF_OBSERVATION, dtype=np.float32),
+                legal_action=np.ones(Config.ACTION_NUM, dtype=np.float32),
+                act=np.array([0], dtype=np.float32),
+                reward=np.array([1.0], dtype=np.float32),
+                done=np.array([0.0], dtype=np.float32),
+                value=np.array([0.2], dtype=np.float32),
+                next_value=np.array([0.7], dtype=np.float32),
+                advantage=np.zeros(1, dtype=np.float32),
+                reward_sum=np.zeros(1, dtype=np.float32),
+                value_head_reward=np.ones(Config.VALUE_HEAD_NUM, dtype=np.float32),
+                value_head_sum=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
+                value_heads=np.full(Config.VALUE_HEAD_NUM, 0.2, dtype=np.float32),
+                next_value_heads=np.full(Config.VALUE_HEAD_NUM, 0.7, dtype=np.float32),
+                aux_target=np.array([0.1, 0.5, 0.3], dtype=np.float32),
+                prob=np.full(Config.ACTION_NUM, 1.0 / Config.ACTION_NUM, dtype=np.float32),
+                action_prior=np.zeros(Config.ACTION_NUM, dtype=np.float32),
+            )
+        ]
+
+        processed = sample_process(rollout)
+
+        self.assertAlmostEqual(float(processed[-1].reward_sum[0]), 1.0 + Config.GAMMA * 0.7, places=5)
+        self.assertTrue(np.all(processed[-1].value_head_sum > 1.0))
+
     def test_algorithm_learn_runs_multi_epoch_updates(self):
         rollout = []
         for step_idx in range(16):
@@ -241,6 +268,25 @@ class RecurrentPPOTests(unittest.TestCase):
         self.assertLess(reward_info["no_progress_penalty"], 0.0)
         self.assertLess(reward_info["local_loop_penalty"], 0.0)
         self.assertGreater(reward_info["positioning_need"], 0.5)
+
+    def test_explore_penalizes_ten_step_position_loop(self):
+        explore_processor = ExploreProcessor()
+        hero_pos = {"x": 10, "z": 10}
+
+        reward_info = None
+        for step_idx in range(11):
+            reward_info = explore_processor.calc_reward(
+                hero_pos=hero_pos,
+                step_no=step_idx,
+                danger_score=0.1,
+                terrain_stats={"dead_end_risk": 0.1, "readiness_score": 0.8},
+            )
+
+        loop_feat = explore_processor.get_feats(hero_pos)
+
+        self.assertLess(reward_info["window_loop_penalty"], 0.0)
+        self.assertEqual(loop_feat.shape, (6,))
+        self.assertEqual(float(loop_feat[3]), 1.0)
 
     def test_speedup_critical_prune_keeps_best_escape_actions(self):
         preprocessor = Preprocessor()
@@ -596,6 +642,55 @@ class RecurrentPPOTests(unittest.TestCase):
         )
 
         self.assertGreater(danger_weight, safe_weight)
+
+    def test_first_seen_treasure_reward_only_once(self):
+        processor = OrganProcessor()
+        env_info = {"treasures_collected": 0, "collected_buff": 0}
+        hero_pos = {"x": 0, "z": 0}
+        organs = [
+            {
+                "status": 1,
+                "sub_type": 1,
+                "config_id": 1,
+                "hero_relative_direction": 1,
+                "pos": {"x": 8, "z": 0},
+            }
+        ]
+
+        first_reward = processor.calc_reward(env_info, organs, hero_pos, hero={}, terrain_stats={}, danger_score=0.1)
+        second_reward = processor.calc_reward(env_info, organs, hero_pos, hero={}, terrain_stats={}, danger_score=0.1)
+
+        self.assertEqual(first_reward["first_seen_treasure_count"], 1)
+        self.assertEqual(second_reward["first_seen_treasure_count"], 0)
+        self.assertGreater(first_reward["treasure_reward"], second_reward["treasure_reward"])
+
+    def test_organ_memory_features_keep_seen_uncollected_loot(self):
+        processor = OrganProcessor()
+        hero_pos = {"x": 0, "z": 0}
+        organs = [
+            {
+                "status": 1,
+                "sub_type": 1,
+                "config_id": 1,
+                "hero_relative_direction": 1,
+                "pos": {"x": 12, "z": 0},
+            },
+            {
+                "status": 1,
+                "sub_type": 2,
+                "config_id": 2,
+                "hero_relative_direction": 3,
+                "pos": {"x": 0, "z": 12},
+            },
+        ]
+
+        visible_memory = processor.get_memory_feats(organs, hero_pos)
+        hidden_memory = processor.get_memory_feats([], {"x": 0, "z": 4})
+
+        self.assertEqual(visible_memory.shape, (8,))
+        self.assertEqual(float(hidden_memory[0]), 1.0)
+        self.assertEqual(float(hidden_memory[4]), 1.0)
+        self.assertGreater(float(hidden_memory[1]), 0.0)
 
     def test_monster_prediction_detects_approach_pressure(self):
         processor = MonsterProcessor()

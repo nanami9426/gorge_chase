@@ -9,6 +9,7 @@ TREASURE_NEAR_APPROACH_BONUS = 3.20
 BUFF_APPROACH_REWARD_SCALE = 0.65
 TREASURE_PICKUP_REWARD = 8.0
 BUFF_PICKUP_REWARD = 3.0
+FIRST_SEEN_TREASURE_REWARD = 0.35
 TREASURE_NEAR_DIST_NORM = 10.0 / MAX_MAP_DISTANCE # 近距离宝箱的阈值，大约是6格以内
 TREASURE_STALL_PENALTY_SCALE = 0.045
 TREASURE_STALL_PENALTY_CAP = 0.45
@@ -51,10 +52,14 @@ class OrganProcessor:
         self.last_treasure_dist_norm = None
         self.last_treasure_key = None
         self.last_buff_dist_norm = None
+        self.last_buff_key = None
         self.last_treasures_collected = None
         self.last_collected_buff = None
         self.treasure_stall_steps = 0
         self.treasure_no_progress_steps = 0
+        self.seen_treasure_keys = set()
+        self.known_treasures = {}
+        self.known_buffs = {}
 
     def get_feats(self, organs, hero_pos):
         available_organs = self.build_available_organs(organs, hero_pos)
@@ -68,9 +73,45 @@ class OrganProcessor:
             ]
         )
         return organs_feat
+
+    def get_memory_feats(self, organs, hero_pos):
+        available_organs = self.build_available_organs(organs, hero_pos)
+        self.update_memory_from_available(available_organs)
+        cached_organs = self.build_cached_organs(hero_pos)
+        nearest_known_treasure = self.select_nearest_organ(cached_organs, sub_type=1)
+        nearest_known_buff = self.select_nearest_organ(cached_organs, sub_type=2)
+        return np.concatenate(
+            [
+                self.encode_organ_feat(nearest_known_treasure),
+                self.encode_organ_feat(nearest_known_buff),
+            ]
+        ).astype(np.float32)
     
     def direction_to_vector(self, direction_idx):
         return DIRECTION_TO_VECTOR.get(int(direction_idx), (0.0, 0.0))
+
+    def direction_from_pos(self, organ_pos, hero_pos):
+        if not isinstance(organ_pos, dict) or "x" not in organ_pos or "z" not in organ_pos:
+            return None
+
+        delta_x = float(organ_pos["x"] - hero_pos["x"])
+        delta_z = float(organ_pos["z"] - hero_pos["z"])
+        norm = float(np.sqrt(delta_x * delta_x + delta_z * delta_z))
+        if norm <= 1e-6:
+            return 0.0, 0.0
+        return delta_x / norm, delta_z / norm
+
+    def make_organ_key(self, organ, sub_type):
+        config_id = int(organ.get("config_id", -1))
+        if config_id >= 0:
+            return (int(sub_type), config_id)
+        return self.make_memory_key(organ, sub_type)
+
+    def make_memory_key(self, organ, sub_type):
+        organ_pos = organ.get("pos")
+        if isinstance(organ_pos, dict) and "x" in organ_pos and "z" in organ_pos:
+            return (int(sub_type), int(round(float(organ_pos["x"]))), int(round(float(organ_pos["z"]))))
+        return (int(sub_type), int(organ.get("config_id", -1)))
 
     def calc_organ_dist_norm(self, organ, hero_pos):
         # 计算单个物件到英雄的归一化距离。
@@ -90,17 +131,64 @@ class OrganProcessor:
             sub_type = int(organ.get("sub_type", 0)) # 物件类型（1=宝箱，2=加速 buff）
             if sub_type not in (1, 2):
                 continue
-            dir_x, dir_z = self.direction_to_vector(organ.get("hero_relative_direction", 0)) # 物件相对于英雄的方位（0-8）
+            organ_pos = organ.get("pos")
+            pos_dir = self.direction_from_pos(organ_pos, hero_pos)
+            if pos_dir is None:
+                dir_x, dir_z = self.direction_to_vector(organ.get("hero_relative_direction", 0)) # 物件相对于英雄的方位（0-8）
+            else:
+                dir_x, dir_z = pos_dir
             available_organs.append(
                 {
-                    "key": (sub_type, int(organ.get("config_id", -1))), # 配置 ID（实体 ID）
+                    "key": self.make_organ_key(organ, sub_type),
+                    "memory_key": self.make_memory_key(organ, sub_type),
                     "sub_type": sub_type,
                     "dist_norm": self.calc_organ_dist_norm(organ, hero_pos),
                     "dir_x": dir_x,
                     "dir_z": dir_z,
+                    "pos": organ_pos,
                 }
             )
         return available_organs
+
+    def update_memory_from_available(self, available_organs):
+        for organ in available_organs:
+            if not isinstance(organ.get("pos"), dict):
+                continue
+
+            memory_item = {
+                "key": organ["key"],
+                "memory_key": organ["memory_key"],
+                "sub_type": organ["sub_type"],
+                "pos": {
+                    "x": float(organ["pos"]["x"]),
+                    "z": float(organ["pos"]["z"]),
+                },
+            }
+            if int(organ["sub_type"]) == 1:
+                self.known_treasures[organ["memory_key"]] = memory_item
+            elif int(organ["sub_type"]) == 2:
+                self.known_buffs[organ["memory_key"]] = memory_item
+
+    def build_cached_organs(self, hero_pos):
+        cached_organs = []
+        for memory_dict in (self.known_treasures, self.known_buffs):
+            for organ in memory_dict.values():
+                organ_pos = organ.get("pos")
+                if not isinstance(organ_pos, dict):
+                    continue
+                dir_x, dir_z = self.direction_from_pos(organ_pos, hero_pos)
+                cached_organs.append(
+                    {
+                        "key": organ["key"],
+                        "memory_key": organ.get("memory_key", organ["key"]),
+                        "sub_type": organ["sub_type"],
+                        "dist_norm": self.calc_organ_dist_norm({"pos": organ_pos}, hero_pos),
+                        "dir_x": dir_x,
+                        "dir_z": dir_z,
+                        "pos": organ_pos,
+                    }
+                )
+        return cached_organs
 
     def select_nearest_organ(self, organs, sub_type=None):
         # 从候选物件中挑出最近的目标。
@@ -228,15 +316,20 @@ class OrganProcessor:
 
     def calc_reward(self, env_info, organs, hero_pos, hero=None, terrain_stats=None, danger_score=0.0):
         available_organs = self.build_available_organs(organs, hero_pos)
+        self.update_memory_from_available(available_organs)
+        cached_organs = self.build_cached_organs(hero_pos)
+        cached_treasures = [organ for organ in cached_organs if int(organ["sub_type"]) == 1]
         available_treasure_count = sum(1 for organ in available_organs if int(organ["sub_type"]) == 1)
         available_buff_count = sum(1 for organ in available_organs if int(organ["sub_type"]) == 2)
         nearest_treasure = self.select_nearest_organ(available_organs, sub_type=1)
         nearest_buff = self.select_nearest_organ(available_organs, sub_type=2)
+        nearest_cached_buff = self.select_nearest_organ(cached_organs, sub_type=2)
         treasures = [organ for organ in available_organs if int(organ["sub_type"]) == 1]
         terrain_stats = terrain_stats or {}
         trap_risk = float(terrain_stats.get("trap_risk", 0.0))
         readiness_score = float(terrain_stats.get("readiness_score", 0.0))
         target_treasure = None
+        target_from_memory = False
         if treasures:
             target_treasure = max(
                 treasures,
@@ -246,6 +339,9 @@ class OrganProcessor:
                     danger_score=danger_score,
                 ),
             )
+        elif cached_treasures:
+            target_treasure = min(cached_treasures, key=lambda treasure: treasure["dist_norm"])
+            target_from_memory = True
         approach_scale = 1.0
         if trap_risk >= 0.45:
             approach_scale = float(np.clip(1.0 - 0.5 * trap_risk, 0.5, 1.0))
@@ -260,14 +356,22 @@ class OrganProcessor:
         buff_priority_weight = self.calc_buff_priority_weight(
             hero=hero,
             nearest_treasure=nearest_treasure,
-            nearest_buff=nearest_buff,
+            nearest_buff=nearest_buff or nearest_cached_buff,
             danger_score=danger_score,
             trap_risk=trap_risk,
         )
 
         treasure_reward = 0.0
         buff_reward = 0.0
+        first_seen_treasure_count = 0
+        for treasure in treasures:
+            if treasure["memory_key"] not in self.seen_treasure_keys:
+                self.seen_treasure_keys.add(treasure["memory_key"])
+                first_seen_treasure_count += 1
+        treasure_reward += first_seen_treasure_count * FIRST_SEEN_TREASURE_REWARD * treasure_approach_weight
+
         target_treasure_key = None if target_treasure is None else target_treasure["key"]
+        target_treasure_memory_key = None if target_treasure is None else target_treasure.get("memory_key")
         same_treasure_target = (
             target_treasure is not None
             and self.last_treasure_key == target_treasure_key
@@ -280,6 +384,8 @@ class OrganProcessor:
                 (TREASURE_NEAR_DIST_NORM - target_treasure["dist_norm"]) / max(TREASURE_NEAR_DIST_NORM, 1e-6),
             )
             treasure_scale = TREASURE_APPROACH_REWARD_SCALE + TREASURE_NEAR_APPROACH_BONUS * close_ratio
+            if target_from_memory:
+                treasure_scale *= 0.45
             delta_dist = self.last_treasure_dist_norm - target_treasure["dist_norm"]
 
             if delta_dist > 0:
@@ -287,10 +393,19 @@ class OrganProcessor:
                 treasure_reward += treasure_approach_scale * treasure_scale * delta_dist
             else:
                 # 高危险时允许主动远离宝箱去拉开身位，不因为宝箱目标给负反馈。
-                treasure_reward += treasure_approach_scale * TREASURE_APPROACH_REWARD_SCALE * delta_dist
-        if nearest_buff is not None and self.last_buff_dist_norm is not None:
-            delta_buff_dist = self.last_buff_dist_norm - nearest_buff["dist_norm"]
-            buff_reward += buff_approach_scale * buff_priority_weight * BUFF_APPROACH_REWARD_SCALE * delta_buff_dist
+                treasure_reward += treasure_approach_scale * treasure_scale * delta_dist
+
+        target_buff = nearest_buff or nearest_cached_buff
+        target_buff_key = None if target_buff is None else target_buff["key"]
+        same_buff_target = (
+            target_buff is not None
+            and self.last_buff_key == target_buff_key
+            and self.last_buff_dist_norm is not None
+        )
+        if target_buff is not None and same_buff_target:
+            delta_buff_dist = self.last_buff_dist_norm - target_buff["dist_norm"]
+            buff_scale = BUFF_APPROACH_REWARD_SCALE * (0.55 if nearest_buff is None else 1.0)
+            buff_reward += buff_approach_scale * buff_priority_weight * buff_scale * delta_buff_dist
 
         # 拾取奖励，通过 treasures_collected 和 collected_buff 判断本帧是否真的完成了拾取
         treasures_collected = int(env_info.get("treasures_collected", 0))
@@ -305,6 +420,13 @@ class OrganProcessor:
 
         treasure_reward += treasure_gain * TREASURE_PICKUP_REWARD
         buff_reward += buff_gain * BUFF_PICKUP_REWARD
+        if treasure_gain > 0:
+            if target_treasure_memory_key is not None:
+                self.known_treasures.pop(target_treasure_memory_key, None)
+            elif target_treasure_key is not None:
+                for memory_key, organ in list(self.known_treasures.items()):
+                    if organ.get("key") == target_treasure_key:
+                        self.known_treasures.pop(memory_key, None)
 
         # 已经非常接近宝箱却连续几步没有拿到，说明很可能在墙边抖动或绕不进去，给予额外惩罚
         treasure_stall_penalty = 0.0
@@ -340,7 +462,8 @@ class OrganProcessor:
         # 在奖励结算后刷新缓存
         self.last_treasure_dist_norm = None if target_treasure is None else target_treasure["dist_norm"]
         self.last_treasure_key = target_treasure_key
-        self.last_buff_dist_norm = None if nearest_buff is None else nearest_buff["dist_norm"]
+        self.last_buff_dist_norm = None if target_buff is None else target_buff["dist_norm"]
+        self.last_buff_key = target_buff_key
         self.last_treasures_collected = treasures_collected
         self.last_collected_buff = collected_buff
         return {
@@ -352,5 +475,8 @@ class OrganProcessor:
             "buffs_collected": int(collected_buff),
             "available_treasure_count": int(available_treasure_count),
             "available_buff_count": int(available_buff_count),
-            "nearest_buff_dist_norm": float(1.0 if nearest_buff is None else nearest_buff["dist_norm"]),
+            "known_treasure_count": int(len(self.known_treasures)),
+            "known_buff_count": int(len(self.known_buffs)),
+            "first_seen_treasure_count": int(first_seen_treasure_count),
+            "nearest_buff_dist_norm": float(1.0 if target_buff is None else target_buff["dist_norm"]),
         }

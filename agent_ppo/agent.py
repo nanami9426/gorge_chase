@@ -103,6 +103,18 @@ class Agent(BaseAgent):
             )
         ]
 
+    def value_process(self, obs_data):
+        """Estimate critic values for an already processed observation."""
+        _, value, value_heads, _, _ = self._run_model(
+            obs_data.feature,
+            obs_data.legal_action,
+            action_prior=getattr(obs_data, "action_prior", None),
+        )
+        return (
+            np.array(value, dtype=np.float32).flatten()[:1],
+            np.array(value_heads, dtype=np.float32).flatten()[: Config.VALUE_HEAD_NUM],
+        )
+
     def exploit(self, env_obs):
         """Greedy inference for evaluation.
 

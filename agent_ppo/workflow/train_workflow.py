@@ -43,7 +43,7 @@ CURRICULUM_STAGE_CONFIG = {
             "buff_count": 2,
             "monster_interval": 500,
             "monster_speedup": 700,
-            "max_step": 1000,
+            "max_step": 2000,
         },
         "loot_reward_scale": 0.70,
     },
@@ -52,7 +52,7 @@ CURRICULUM_STAGE_CONFIG = {
             "buff_count": 2,
             "monster_interval": 340,
             "monster_speedup": 560,
-            "max_step": 1000,
+            "max_step": 2000,
         },
         "loot_reward_scale": 1.25,
     },
@@ -61,7 +61,7 @@ CURRICULUM_STAGE_CONFIG = {
             "buff_count": 2,
             "monster_interval": 300,
             "monster_speedup": 500,
-            "max_step": 1000,
+            "max_step": 2000,
         },
         "loot_reward_scale": 1.15,
     },
@@ -342,6 +342,8 @@ class EpisodeRunner:
                 truncated = env_obs["truncated"]
                 step += 1
                 done = terminated or truncated
+                bootstrap_value = np.zeros(1, dtype=np.float32)
+                bootstrap_value_heads = np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32)
 
                 # Next observation / 处理下一步观测
                 _obs_data, _remain_info = self.agent.observation_process(
@@ -350,6 +352,8 @@ class EpisodeRunner:
                     loot_reward_scale=loot_reward_scale,
                 )
                 _remain_info["curriculum_stage"] = curriculum_stage
+                if truncated and not terminated:
+                    bootstrap_value, bootstrap_value_heads = self.agent.value_process(_obs_data)
 
                 # Step reward / 每步即时奖励
                 reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
@@ -385,10 +389,14 @@ class EpisodeRunner:
                     "explore_streak_bonus",
                     "no_progress_penalty",
                     "local_loop_penalty",
+                    "window_loop_penalty",
                     "positioning_need",
                     "buff_priority_weight",
                     "available_treasure_count",
                     "available_buff_count",
+                    "known_treasure_count",
+                    "known_buff_count",
+                    "first_seen_treasure_count",
                     "nearest_buff_dist_norm",
                 ):
                     behavior_metric_sum[key] += float(_remain_info.get(key, 0.0))
@@ -416,7 +424,7 @@ class EpisodeRunner:
                         result_str = "FAIL"
                     else:
                         terminal_survival_reward = 3.0
-                        result_str = "WIN"
+                        result_str = "TRUNCATED" if truncated else "WIN"
                     terminal_loot_reward = 0.45 * float(treasures_collected) + 0.10 * float(collected_buff)
                     final_reward[0] = terminal_survival_reward + terminal_loot_reward
 
@@ -458,6 +466,10 @@ class EpisodeRunner:
                         behavior_metric_sum.get("local_loop_penalty", 0.0) / max(step, 1),
                         4,
                     )
+                    window_loop_penalty_mean = round(
+                        behavior_metric_sum.get("window_loop_penalty", 0.0) / max(step, 1),
+                        4,
+                    )
                     positioning_need_mean = round(
                         behavior_metric_sum.get("positioning_need", 0.0) / max(step, 1),
                         4,
@@ -474,6 +486,13 @@ class EpisodeRunner:
                         behavior_metric_sum.get("nearest_buff_dist_norm", 0.0) / max(step, 1),
                         4,
                     )
+                    known_treasure_count_mean = round(
+                        behavior_metric_sum.get("known_treasure_count", 0.0) / max(step, 1),
+                        4,
+                    )
+                    first_seen_treasure_count = int(
+                        round(behavior_metric_sum.get("first_seen_treasure_count", 0.0))
+                    )
                     self.logger.info(
                         f"[PHASE] episode:{self.episode_cnt} terminal_phase:{terminal_phase} "
                         f"phase_step_counts:{phase_step_counts_log} "
@@ -484,10 +503,13 @@ class EpisodeRunner:
                         f"explore_streak_mean:{explore_streak_mean} "
                         f"no_progress_penalty_mean:{no_progress_penalty_mean} "
                         f"local_loop_penalty_mean:{local_loop_penalty_mean} "
+                        f"window_loop_penalty_mean:{window_loop_penalty_mean} "
                         f"positioning_need_mean:{positioning_need_mean} "
                         f"buff_priority_weight_mean:{buff_priority_weight_mean} "
                         f"available_buff_count_mean:{available_buff_count_mean} "
                         f"nearest_buff_dist_mean:{nearest_buff_dist_mean} "
+                        f"known_treasure_count_mean:{known_treasure_count_mean} "
+                        f"first_seen_treasure_count:{first_seen_treasure_count} "
                         f"curriculum_stage:{curriculum_stage}"
                     )
                     curriculum_metrics, promoted = self.curriculum_tracker.record_episode(
@@ -515,14 +537,14 @@ class EpisodeRunner:
                     legal_action=np.array(obs_data.legal_action, dtype=np.float32),
                     act=np.array([act_data.action[0]], dtype=np.float32),
                     reward=reward,
-                    done=np.array([float(done)], dtype=np.float32),
+                    done=np.array([float(terminated)], dtype=np.float32),
                     reward_sum=np.zeros(1, dtype=np.float32),
                     value_head_reward=value_head_reward,
                     value_head_sum=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
                     value=np.array(act_data.value, dtype=np.float32).flatten()[:1],
-                    next_value=np.zeros(1, dtype=np.float32),
+                    next_value=bootstrap_value,
                     value_heads=np.array(act_data.value_heads, dtype=np.float32).flatten()[: Config.VALUE_HEAD_NUM],
-                    next_value_heads=np.zeros(Config.VALUE_HEAD_NUM, dtype=np.float32),
+                    next_value_heads=bootstrap_value_heads,
                     advantage=np.zeros(1, dtype=np.float32),
                     aux_target=aux_target,
                     prob=np.array(act_data.prob, dtype=np.float32),

@@ -25,6 +25,9 @@ RECENT_GRID_WINDOW = 20
 VISIT_COUNT_NORM_CAP = 6.0
 NO_PROGRESS_NORM_CAP = 20.0
 MEMORY_EMA_ALPHA = 0.15
+LOOP_LOOKBACK_WINDOW = 10
+LOOP_DISTANCE_THRESHOLD = 5.0
+LOOP_WINDOW_PENALTY = 0.10
 
 SAFE_MEMORY_DIRS = [
     (1, 0),
@@ -51,6 +54,7 @@ class ExploreProcessor:
         self.no_progress_steps = 0
         self.explore_streak_steps = 0
         self.recent_grids = deque(maxlen=RECENT_GRID_WINDOW)
+        self.position_history = deque(maxlen=LOOP_LOOKBACK_WINDOW + 1)
         self.danger_grid_ema = {}
 
     def get_grid(self, hero_pos):
@@ -102,13 +106,32 @@ class ExploreProcessor:
 
     def get_feats(self, hero_pos):
         context = self.get_context(hero_pos)
+        lookback_valid, lookback_dx_norm, lookback_dz_norm, _ = self.get_lookback_position_info(hero_pos)
         return np.array(
             [
                 context["current_grid_visit_count_norm"],
                 context["frontier_ratio"],
                 context["no_progress_steps_norm"],
+                lookback_valid,
+                lookback_dx_norm,
+                lookback_dz_norm,
             ],
             dtype=np.float32,
+        )
+
+    def get_lookback_position_info(self, hero_pos):
+        if len(self.position_history) < LOOP_LOOKBACK_WINDOW:
+            return 0.0, 0.0, 0.0, 0.0
+
+        lookback_pos = self.position_history[-LOOP_LOOKBACK_WINDOW]
+        delta_x = float(hero_pos["x"] - lookback_pos[0])
+        delta_z = float(hero_pos["z"] - lookback_pos[1])
+        loop_dist = math.sqrt(delta_x * delta_x + delta_z * delta_z)
+        return (
+            1.0,
+            float(np.clip(delta_x / LOOP_DISTANCE_THRESHOLD, -1.0, 1.0)),
+            float(np.clip(delta_z / LOOP_DISTANCE_THRESHOLD, -1.0, 1.0)),
+            loop_dist,
         )
 
     def get_memory_feats(self, hero_pos):
@@ -245,6 +268,12 @@ class ExploreProcessor:
             * (0.40 + positioning_need),
             LOCAL_LOOP_PENALTY_CAP,
         )
+        lookback_valid, _, _, loop_dist = self.get_lookback_position_info(hero_pos)
+        window_loop_penalty = (
+            -LOOP_WINDOW_PENALTY
+            if lookback_valid > 0.0 and loop_dist < LOOP_DISTANCE_THRESHOLD
+            else 0.0
+        )
 
         self.visited_grid_counts[grid] = context["visit_count_after"]
         self.update_safety_memory(grid=grid, danger_score=danger_score, terrain_stats=terrain_stats)
@@ -252,6 +281,7 @@ class ExploreProcessor:
         self.explore_streak_steps = explore_streak_steps
         self.last_hero_pos = cur_pos
         self.recent_grids.append(grid)
+        self.position_history.append(cur_pos)
         return {
             "reward": float(
                 positive_reward
@@ -259,11 +289,13 @@ class ExploreProcessor:
                 + stall_penalty
                 + no_progress_penalty
                 + local_loop_penalty
+                + window_loop_penalty
             ),
             "explore_new_grid": int(explore_new_grid),
             "frontier_bonus": float(safe_explore_weight * frontier_bonus),
             "explore_streak_bonus": float(safe_explore_weight * explore_streak_bonus),
             "no_progress_penalty": float(no_progress_penalty),
             "local_loop_penalty": float(local_loop_penalty),
+            "window_loop_penalty": float(window_loop_penalty),
             "positioning_need": float(positioning_need),
         }

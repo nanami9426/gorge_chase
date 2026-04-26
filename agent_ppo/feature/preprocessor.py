@@ -207,6 +207,7 @@ class Preprocessor:
         hero,
         danger_score,
         max_monster_speed,
+        cached_organs_feat=None,
         treasure_priority_feat=None,
     ):
         legal_action = list(legal_action)
@@ -251,6 +252,13 @@ class Preprocessor:
         organs_feat = np.asarray(organs_feat, dtype=np.float32)
         treasure_feat = organs_feat[:4]
         buff_feat = organs_feat[4:8]
+        cached_organs_feat = (
+            np.asarray(cached_organs_feat, dtype=np.float32)
+            if cached_organs_feat is not None
+            else np.zeros(8, dtype=np.float32)
+        )
+        cached_treasure_feat = cached_organs_feat[:4]
+        cached_buff_feat = cached_organs_feat[4:8]
         treasure_priority_feat = (
             np.asarray(treasure_priority_feat, dtype=np.float32)
             if treasure_priority_feat is not None
@@ -261,8 +269,10 @@ class Preprocessor:
         priority_weight = float(np.clip(treasure_priority_feat[4], 0.0, 1.0)) if priority_has_target else 0.0
         priority_safe = priority_has_target and float(treasure_priority_feat[5]) > 0.0
 
-        if float(buff_feat[0]) > 0.0:
-            buff_dist = float(np.clip(buff_feat[1], 0.0, 1.0))
+        buff_target_feat = buff_feat if float(buff_feat[0]) > 0.0 else cached_buff_feat
+        buff_from_memory = float(buff_feat[0]) <= 0.0 and float(cached_buff_feat[0]) > 0.0
+        if float(buff_target_feat[0]) > 0.0:
+            buff_dist = float(np.clip(buff_target_feat[1], 0.0, 1.0))
             buff_need = float(
                 np.clip(
                     0.30
@@ -276,9 +286,11 @@ class Preprocessor:
             )
             if priority_weight >= 0.55 and danger_score <= ACTION_PRIOR_SAFE_TREASURE_DANGER:
                 buff_need *= 0.45
+            if buff_from_memory:
+                buff_need *= 0.55
             self.add_direction_prior(
                 action_prior=action_prior,
-                target_feat=buff_feat,
+                target_feat=buff_target_feat,
                 weight=buff_need * (1.0 - 0.35 * buff_dist),
                 legal_action=legal_action,
             )
@@ -289,7 +301,8 @@ class Preprocessor:
             and dead_end_risk <= 0.35
         )
         critical_escape = danger_score >= ACTION_PRIOR_CRITICAL_LOOT_DANGER and escape_need >= 0.65
-        if float(treasure_feat[0]) > 0.0 and not critical_escape:
+        treasure_target_available = float(treasure_feat[0]) > 0.0 or float(cached_treasure_feat[0]) > 0.0
+        if treasure_target_available and not critical_escape:
             target_feat = treasure_feat
             if priority_has_target:
                 target_feat = np.array(
@@ -301,6 +314,8 @@ class Preprocessor:
                     ],
                     dtype=np.float32,
                 )
+            elif float(target_feat[0]) <= 0.0:
+                target_feat = cached_treasure_feat
             treasure_dist = float(np.clip(target_feat[1], 0.0, 1.0))
             target_action_idx = self.dir_vector_to_action_idx(target_feat[2], target_feat[3])
             route_alignment = 0.0
@@ -319,6 +334,8 @@ class Preprocessor:
             )
             if priority_safe or safe_treasure:
                 loot_weight = max(loot_weight, 0.60 + 0.30 * priority_weight)
+            if float(treasure_feat[0]) <= 0.0:
+                loot_weight *= 0.60
             self.add_direction_prior(
                 action_prior=action_prior,
                 target_feat=target_feat,
@@ -378,6 +395,7 @@ class Preprocessor:
         # OrganState[] 物件状态列表（宝箱、buff）
         organs = frame_state.get("organs", [])
         organs_feat = self.organ_processor.get_feats(organs=organs, hero_pos=hero_pos)
+        cached_organs_feat = self.organ_processor.get_memory_feats(organs=organs, hero_pos=hero_pos)
         explore_feat = self.explore_processor.get_feats(hero_pos=hero_pos)
         normalized_map_info, spatial_feat = self.spatial_encoder.encode(
             map_info=map_info,
@@ -444,6 +462,7 @@ class Preprocessor:
             legal_action=legal_action,
             terrain_stats=terrain_stats,
             organs_feat=organs_feat,
+            cached_organs_feat=cached_organs_feat,
             hero=hero,
             danger_score=danger_score,
             max_monster_speed=max_monster_speed,
@@ -462,6 +481,7 @@ class Preprocessor:
                 monster_feats[1],
                 monster_prediction_feat,
                 organs_feat,
+                cached_organs_feat,
                 treasure_priority_feat,
                 explore_feat,
                 memory_feat,
@@ -563,12 +583,16 @@ class Preprocessor:
             "explore_streak_bonus": float(explore_reward_info["explore_streak_bonus"]),
             "no_progress_penalty": float(explore_reward_info["no_progress_penalty"]),
             "local_loop_penalty": float(explore_reward_info["local_loop_penalty"]),
+            "window_loop_penalty": float(explore_reward_info["window_loop_penalty"]),
             "positioning_need": float(explore_reward_info["positioning_need"]),
             "buff_priority_weight": float(organ_reward["buff_priority_weight"]),
             "treasure_approach_weight": float(organ_reward["treasure_approach_weight"]),
             "buffs_collected": int(organ_reward["buffs_collected"]),
             "available_treasure_count": int(organ_reward["available_treasure_count"]),
             "available_buff_count": int(organ_reward["available_buff_count"]),
+            "known_treasure_count": int(organ_reward["known_treasure_count"]),
+            "known_buff_count": int(organ_reward["known_buff_count"]),
+            "first_seen_treasure_count": int(organ_reward["first_seen_treasure_count"]),
             "nearest_buff_dist_norm": float(organ_reward["nearest_buff_dist_norm"]),
             "reward_breakdown": {
                 "raw": raw_reward_breakdown,
