@@ -82,6 +82,7 @@ class Model(nn.Module):
         action_num = Config.ACTION_NUM
         value_head_num = Config.VALUE_HEAD_NUM
         aux_target_num = Config.AUX_TARGET_NUM
+        hidden_dim = Config.HIDDEN_DIM
         frame_embed_dim = Config.FRAME_EMBED_DIM
         temporal_hidden_dim = Config.TEMPORAL_HIDDEN_DIM
 
@@ -89,11 +90,11 @@ class Model(nn.Module):
         self.temporal_window = temporal_window
 
         self.dense_backbone = nn.Sequential(
-            make_fc_layer(dense_dim, 128),
-            nn.LayerNorm(128),
+            make_fc_layer(dense_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            make_fc_layer(128, 128),
-            nn.LayerNorm(128),
+            make_fc_layer(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
         )
 
@@ -108,13 +109,13 @@ class Model(nn.Module):
         conv_output_size = spatial_map_size // 4 + 1
         self.spatial_proj = nn.Sequential(
             nn.Flatten(),
-            make_fc_layer(64 * conv_output_size * conv_output_size, 96),
-            nn.LayerNorm(96),
+            make_fc_layer(64 * conv_output_size * conv_output_size, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
         )
 
         self.frame_fusion = nn.Sequential(
-            make_fc_layer(224, frame_embed_dim),
+            make_fc_layer(hidden_dim * 2, frame_embed_dim),
             nn.LayerNorm(frame_embed_dim),
             nn.ReLU(),
         )
@@ -128,25 +129,25 @@ class Model(nn.Module):
         self.attention_norm = nn.LayerNorm(temporal_hidden_dim)
 
         self.fusion = nn.Sequential(
-            make_fc_layer(frame_embed_dim + temporal_hidden_dim * 2, 128),
-            nn.LayerNorm(128),
+            make_fc_layer(frame_embed_dim + temporal_hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            make_fc_layer(128, 128),
-            nn.LayerNorm(128),
+            make_fc_layer(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
         )
 
         # Actor head / 策略头
-        self.actor_head = make_fc_layer(128, action_num)
+        self.actor_head = make_fc_layer(hidden_dim, action_num)
 
         # Multi-head critic / 多头价值
-        self.value_head = make_fc_layer(128, value_head_num)
+        self.value_head = make_fc_layer(hidden_dim, value_head_num)
 
         # Auxiliary prediction head / 辅助预测头
         self.aux_head = nn.Sequential(
-            make_fc_layer(128, 64),
+            make_fc_layer(hidden_dim, hidden_dim),
             nn.ReLU(),
-            make_fc_layer(64, aux_target_num),
+            make_fc_layer(hidden_dim, aux_target_num),
             nn.Sigmoid(),
         )
 

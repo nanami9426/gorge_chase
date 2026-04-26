@@ -41,7 +41,7 @@ RISK_PRUNE_RATIO = 0.55
 RISK_PRUNE_MIN_LEGAL_MOVES = 3
 RISK_PRUNE_KEEP_TOPK = 2
 CRITICAL_ESCAPE_DANGER_THRESHOLD = 0.78
-SPEEDUP_ESCAPE_DANGER_THRESHOLD = 0.62
+SPEEDUP_ESCAPE_DANGER_THRESHOLD = 0.48
 CRITICAL_MOVE_KEEP_TOPK = 3
 CRITICAL_FLASH_KEEP_TOPK = 2
 CRITICAL_FLASH_MIN_SCORE = 0.50
@@ -50,6 +50,12 @@ ACTION_PRIOR_BAD_TERRAIN_START = 0.35
 ACTION_PRIOR_SAFE_TREASURE_DANGER = 0.58
 ACTION_PRIOR_SAFE_TREASURE_READINESS = 0.45
 ACTION_PRIOR_CRITICAL_LOOT_DANGER = 0.88
+ACTION_PRIOR_ROUTE_KEEP_MARGIN = 0.08
+ACTION_PRIOR_ROUTE_KEEP_BOOST = 0.18
+ACTION_PRIOR_FRONTIER_DANGER = 0.74
+ACTION_PRIOR_SPEEDUP_LOOT_MAX_DANGER = 0.72
+ACTION_PRIOR_SPEEDUP_LOOT_MAX_DIST = 0.40
+ACTION_PRIOR_SPEEDUP_LOOT_ESCAPE_MARGIN = 0.12
 BFS_ROUTE_DIST_NORM_CAP = 30.0
 
 
@@ -60,6 +66,13 @@ def _norm(v, v_max, v_min=0.0):
     """
     v = float(np.clip(v, v_min, v_max))
     return (v - v_min) / (v_max - v_min) if (v_max - v_min) > 1e-6 else 0.0
+
+
+def calc_speedup_pressure(max_monster_speed) -> float:
+    max_monster_speed = float(max_monster_speed or 1)
+    if max_monster_speed <= 1.0:
+        return 0.0
+    return float(np.clip(0.55 + 0.15 * (max_monster_speed - 2.0), 0.0, 1.0))
 
 
 class Preprocessor:
@@ -127,12 +140,20 @@ class Preprocessor:
         return masked_action, risk_pruned_moves
 
     def prune_critical_escape_actions(self, legal_action, terrain_stats, danger_score, max_monster_speed):
+        speedup_pressure = calc_speedup_pressure(max_monster_speed)
         danger_threshold = (
             SPEEDUP_ESCAPE_DANGER_THRESHOLD
-            if int(max_monster_speed) > 1
+            if speedup_pressure > 0.0
             else CRITICAL_ESCAPE_DANGER_THRESHOLD
         )
-        if float(danger_score) < danger_threshold:
+        speedup_bad_position = (
+            speedup_pressure > 0.0
+            and (
+                float(terrain_stats.get("dead_end_risk", 0.0)) >= 0.40
+                or float(terrain_stats.get("readiness_score", 1.0)) <= 0.50
+            )
+        )
+        if float(danger_score) < danger_threshold and not speedup_bad_position:
             return list(legal_action), 0
 
         masked_action = list(legal_action)
@@ -350,6 +371,8 @@ class Preprocessor:
         cached_organs_feat=None,
         target_route_feat=None,
         treasure_priority_feat=None,
+        explore_feat=None,
+        last_action=None,
     ):
         legal_action = list(legal_action)
         action_prior = np.zeros(16, dtype=np.float32)
@@ -358,6 +381,7 @@ class Preprocessor:
         readiness_score = float(terrain_stats.get("readiness_score", 1.0))
         route_diversity = float(terrain_stats.get("route_diversity", 1.0))
         max_monster_speed = int(max_monster_speed)
+        speedup_pressure = calc_speedup_pressure(max_monster_speed)
 
         bad_terrain_need = float(
             np.clip(
@@ -375,12 +399,24 @@ class Preprocessor:
                 1.0,
             )
         )
-        speedup_need = 0.30 if max_monster_speed > 1 else 0.0
+        speedup_need = 0.0 if speedup_pressure <= 0.0 else float(np.clip(0.50 + 0.35 * speedup_pressure, 0.0, 1.0))
         escape_need = float(np.clip(max(danger_need, bad_terrain_need, speedup_need), 0.0, 1.0))
 
         for idx, score in enumerate(terrain_stats["escape_dir_scores"]):
             if idx < len(legal_action) and legal_action[idx] == 1:
                 action_prior[idx] = max(action_prior[idx], escape_need * float(score))
+        if last_action is not None:
+            last_action_idx = int(last_action)
+            if 0 <= last_action_idx < 8 and legal_action[last_action_idx] == 1:
+                escape_scores = [float(score) for score in terrain_stats["escape_dir_scores"]]
+                best_escape_score = max(escape_scores, default=0.0)
+                last_escape_score = float(escape_scores[last_action_idx])
+                if last_escape_score >= best_escape_score - ACTION_PRIOR_ROUTE_KEEP_MARGIN:
+                    keep_route_prior = min(
+                        1.0,
+                        escape_need * (last_escape_score + ACTION_PRIOR_ROUTE_KEEP_BOOST),
+                    )
+                    action_prior[last_action_idx] = max(action_prior[last_action_idx], keep_route_prior)
 
         best_flash_score = float(terrain_stats.get("best_flash_score", 0.0))
         flash_need = float(np.clip(0.70 * danger_need + 0.55 * bad_terrain_need + speedup_need, 0.0, 1.0))
@@ -450,14 +486,13 @@ class Preprocessor:
             and readiness_score >= ACTION_PRIOR_SAFE_TREASURE_READINESS
             and dead_end_risk <= 0.35
         )
-        critical_escape = danger_score >= ACTION_PRIOR_CRITICAL_LOOT_DANGER and escape_need >= 0.65
         treasure_target_available = (
             float(route_treasure_feat[0]) > 0.0
             or float(treasure_feat[0]) > 0.0
             or float(cached_treasure_feat[0]) > 0.0
         )
-        if treasure_target_available and not critical_escape:
-            target_feat = route_treasure_feat if float(route_treasure_feat[0]) > 0.0 else treasure_feat
+        target_feat = route_treasure_feat if float(route_treasure_feat[0]) > 0.0 else treasure_feat
+        if treasure_target_available:
             if priority_has_target and float(route_treasure_feat[0]) <= 0.0:
                 target_feat = np.array(
                     [
@@ -470,30 +505,86 @@ class Preprocessor:
                 )
             elif float(target_feat[0]) <= 0.0:
                 target_feat = cached_treasure_feat
-            treasure_dist = float(np.clip(target_feat[1], 0.0, 1.0))
-            target_action_idx = self.dir_vector_to_action_idx(target_feat[2], target_feat[3])
-            route_alignment = 0.0
-            if target_action_idx is not None and 0 <= target_action_idx < len(terrain_stats["escape_dir_scores"]):
-                route_alignment = float(np.clip(terrain_stats["escape_dir_scores"][target_action_idx], 0.0, 1.0))
+        treasure_dist = float(np.clip(target_feat[1], 0.0, 1.0)) if treasure_target_available else 1.0
+        target_action_idx = self.dir_vector_to_action_idx(target_feat[2], target_feat[3]) if treasure_target_available else None
+        route_alignment = 0.0
+        best_escape_score = max((float(score) for score in terrain_stats["escape_dir_scores"]), default=0.0)
+        if target_action_idx is not None and 0 <= target_action_idx < len(terrain_stats["escape_dir_scores"]):
+            route_alignment = float(np.clip(terrain_stats["escape_dir_scores"][target_action_idx], 0.0, 1.0))
+        critical_escape = (
+            danger_score >= ACTION_PRIOR_CRITICAL_LOOT_DANGER
+            or (
+                speedup_pressure > 0.0
+                and escape_need >= 0.55
+                and (
+                    danger_score >= 0.45
+                    or bad_terrain_need >= 0.42
+                    or readiness_score <= 0.55
+                )
+            )
+        )
+        speedup_loot_on_escape_route = (
+            critical_escape
+            and speedup_pressure > 0.0
+            and treasure_target_available
+            and danger_score <= ACTION_PRIOR_SPEEDUP_LOOT_MAX_DANGER
+            and treasure_dist <= ACTION_PRIOR_SPEEDUP_LOOT_MAX_DIST
+            and route_alignment >= max(0.58, best_escape_score - ACTION_PRIOR_SPEEDUP_LOOT_ESCAPE_MARGIN)
+            and readiness_score >= 0.35
+            and dead_end_risk <= 0.65
+        )
+        if treasure_target_available and (not critical_escape or speedup_loot_on_escape_route):
             loot_weight = float(
                 np.clip(
-                    0.30
+                    0.36
                     + 0.65 * priority_weight
                     + 0.25 * (1.0 - 0.45 * treasure_dist)
-                    + 0.20 * route_alignment
-                    - 0.35 * escape_need,
+                    + 0.25 * route_alignment
+                    + (0.12 if float(route_treasure_feat[0]) > 0.0 else 0.0)
+                    + (0.18 if speedup_loot_on_escape_route else 0.0)
+                    - 0.30 * escape_need,
                     0.0,
                     1.0,
                 )
             )
             if priority_safe or safe_treasure:
-                loot_weight = max(loot_weight, 0.60 + 0.30 * priority_weight)
+                loot_weight = max(loot_weight, 0.72 + 0.20 * priority_weight)
+            if speedup_loot_on_escape_route:
+                loot_weight = max(loot_weight, 0.62 + 0.24 * priority_weight)
             if float(treasure_feat[0]) <= 0.0:
-                loot_weight *= 0.60
+                loot_weight *= 0.80 if float(route_treasure_feat[0]) > 0.0 else 0.60
             self.add_direction_prior(
                 action_prior=action_prior,
                 target_feat=target_feat,
                 weight=loot_weight,
+                legal_action=legal_action,
+            )
+
+        explore_feat = (
+            np.asarray(explore_feat, dtype=np.float32)
+            if explore_feat is not None
+            else np.zeros(10, dtype=np.float32)
+        )
+        if len(explore_feat) >= 10 and not critical_escape and danger_score <= ACTION_PRIOR_FRONTIER_DANGER:
+            frontier_dir_x = float(explore_feat[6])
+            frontier_dir_z = float(explore_feat[7])
+            frontier_score = float(np.clip(explore_feat[8], 0.0, 1.0))
+            recent_area_ratio = float(np.clip(explore_feat[9], 0.0, 1.0))
+            no_progress_norm = float(np.clip(explore_feat[2], 0.0, 1.0))
+            small_area_need = max(0.0, 0.45 - recent_area_ratio) / 0.45
+            safety_weight = float(np.clip(1.0 - 0.75 * danger_need, 0.25, 1.0))
+            frontier_weight = float(
+                np.clip(
+                    (0.10 + 0.26 * frontier_score + 0.24 * small_area_need + 0.16 * no_progress_norm)
+                    * safety_weight,
+                    0.0,
+                    0.42,
+                )
+            )
+            self.add_direction_prior(
+                action_prior=action_prior,
+                target_feat=np.array([1.0, 0.0, frontier_dir_x, frontier_dir_z], dtype=np.float32),
+                weight=frontier_weight,
                 legal_action=legal_action,
             )
 
@@ -583,6 +674,7 @@ class Preprocessor:
             legal_action=legal_action,
             hero_pos=hero_pos,
             future_monster_positions=future_monster_positions,
+            max_monster_speed=max_monster_speed,
         )
         legal_action, risk_pruned_moves = self.prune_risky_moves(
             legal_action=legal_action,
@@ -592,6 +684,7 @@ class Preprocessor:
         danger_score = self.flash_processor.calc_danger_score(
             monster_feats=monster_feats,
             terrain_stats=terrain_stats,
+            prediction_feat=monster_prediction_feat,
         )
         treasure_priority_feat = self.organ_processor.get_priority_feats(
             organs=organs,
@@ -627,6 +720,8 @@ class Preprocessor:
             danger_score=danger_score,
             max_monster_speed=max_monster_speed,
             treasure_priority_feat=treasure_priority_feat,
+            explore_feat=explore_feat,
+            last_action=last_action,
         )
 
         # Progress features (2D) / 进度特征
@@ -681,6 +776,7 @@ class Preprocessor:
             danger_score=danger_score,
             monster_feats=monster_feats,
             terrain_stats=terrain_stats,
+            max_monster_speed=max_monster_speed,
         )
         move_reward = self.move_processor.calc_reward(last_action=last_action, move_mask=move_mask)
         terrain_reward = self.terrain_processor.calc_reward(
@@ -688,6 +784,7 @@ class Preprocessor:
             terrain_stats=terrain_stats,
             last_action=last_action,
             danger_score=danger_score,
+            max_monster_speed=max_monster_speed,
         )
 
         # 先记录原始分项奖励，再根据阶段做固定重加权
@@ -730,6 +827,7 @@ class Preprocessor:
             "best_route_score": float(terrain_stats["best_route_score"]),
             "safe_area_ratio": float(terrain_stats["safe_area_ratio"]),
             "route_score_gap": float(terrain_stats["route_score_gap"]),
+            "speedup_pressure": float(terrain_stats.get("speedup_pressure", 0.0)),
             "wall_pressure": float(terrain_stats["wall_pressure"]),
             "corner_pressure": float(terrain_stats["corner_pressure"]),
             "risk_pruned_moves": int(risk_pruned_moves),
@@ -748,6 +846,8 @@ class Preprocessor:
             "no_progress_penalty": float(explore_reward_info["no_progress_penalty"]),
             "local_loop_penalty": float(explore_reward_info["local_loop_penalty"]),
             "window_loop_penalty": float(explore_reward_info["window_loop_penalty"]),
+            "small_area_penalty": float(explore_reward_info["small_area_penalty"]),
+            "recent_area_ratio": float(explore_reward_info["recent_area_ratio"]),
             "positioning_need": float(explore_reward_info["positioning_need"]),
             "buff_priority_weight": float(organ_reward["buff_priority_weight"]),
             "treasure_approach_weight": float(organ_reward["treasure_approach_weight"]),

@@ -5,23 +5,26 @@ import numpy as np
 
 
 MAP_SIZE = 128
-EXPLORE_GRID_REWARD = 0.1
-FRONTIER_BONUS_SCALE = 0.015
-EXPLORE_STREAK_BONUS_SCALE = 0.008
-EXPLORE_STREAK_BONUS_CAP = 0.05
+EXPLORE_GRID_REWARD = 0.16
+FRONTIER_BONUS_SCALE = 0.030
+EXPLORE_STREAK_BONUS_SCALE = 0.012
+EXPLORE_STREAK_BONUS_CAP = 0.08
 MOVE_REWARD_SCALE = 0.004
 MOVE_REWARD_CAP = 2.0
-REVISIT_GRID_PENALTY = -0.025
+REVISIT_GRID_PENALTY = -0.040
 NON_RECENT_REVISIT_REWARD = 0.001
 STALL_PENALTY_SCALE = 0.012
 STALL_PENALTY_CAP = 0.30
 NO_PROGRESS_PENALTY_START = 3
-NO_PROGRESS_PENALTY_SCALE = 0.026
+NO_PROGRESS_PENALTY_SCALE = 0.032
 NO_PROGRESS_PENALTY_CAP = 0.45
 LOCAL_LOOP_PENALTY_START = 2
-LOCAL_LOOP_PENALTY_SCALE = 0.018
+LOCAL_LOOP_PENALTY_SCALE = 0.024
 LOCAL_LOOP_PENALTY_CAP = 0.35
 RECENT_GRID_WINDOW = 20
+RECENT_AREA_MIN_UNIQUE_RATIO = 0.35
+SMALL_AREA_PENALTY_SCALE = 0.12
+SMALL_AREA_PENALTY_CAP = 0.25
 VISIT_COUNT_NORM_CAP = 6.0
 NO_PROGRESS_NORM_CAP = 20.0
 MEMORY_EMA_ALPHA = 0.15
@@ -83,12 +86,52 @@ class ExploreProcessor:
         frontier_decay = 1.0 / math.sqrt(max(1.0, float(visit_count_after)))
         return float(raw_frontier_ratio * frontier_decay)
 
+    def get_frontier_direction(self, grid):
+        grid_x, grid_z = grid
+        best_score = 0.0
+        best_dir = (0.0, 0.0)
+        recent_set = set(self.recent_grids)
+
+        for dir_x, dir_z in SAFE_MEMORY_DIRS:
+            next_grid = (grid_x + dir_x, grid_z + dir_z)
+            if not (0 <= next_grid[0] <= self.max_grid_index and 0 <= next_grid[1] <= self.max_grid_index):
+                continue
+
+            visit_count = float(self.visited_grid_counts.get(next_grid, 0))
+            recency_weight = 0.55 if next_grid in recent_set else 1.0
+            frontier_score = recency_weight / (1.0 + visit_count)
+            if frontier_score > best_score:
+                best_score = frontier_score
+                best_dir = (float(dir_x), float(dir_z))
+
+        dir_norm = math.sqrt(best_dir[0] * best_dir[0] + best_dir[1] * best_dir[1])
+        if dir_norm <= 1e-6:
+            return 0.0, 0.0, 0.0
+
+        return (
+            float(best_dir[0] / dir_norm),
+            float(best_dir[1] / dir_norm),
+            float(np.clip(best_score, 0.0, 1.0)),
+        )
+
+    def get_recent_area_ratio(self, current_grid=None) -> float:
+        recent_grids = list(self.recent_grids)
+        if current_grid is not None:
+            recent_grids.append(current_grid)
+        if not recent_grids:
+            return 1.0
+
+        recent_grids = recent_grids[-RECENT_GRID_WINDOW:]
+        return float(len(set(recent_grids)) / max(1, len(recent_grids)))
+
     def get_context(self, hero_pos):
         grid = self.get_grid(hero_pos)
         visit_count_before = int(self.visited_grid_counts.get(grid, 0))
         visit_count_after = visit_count_before + 1
         explore_new_grid = int(visit_count_before == 0)
         frontier_ratio = self.get_frontier_ratio(grid=grid, visit_count_after=visit_count_after)
+        frontier_dir_x, frontier_dir_z, frontier_dir_score = self.get_frontier_direction(grid=grid)
+        recent_area_ratio = self.get_recent_area_ratio(current_grid=grid)
         no_progress_steps = 0 if explore_new_grid else (self.no_progress_steps + 1)
         return {
             "grid": grid,
@@ -102,6 +145,10 @@ class ExploreProcessor:
             "no_progress_steps_norm": float(
                 min(no_progress_steps, NO_PROGRESS_NORM_CAP) / NO_PROGRESS_NORM_CAP
             ),
+            "frontier_dir_x": frontier_dir_x,
+            "frontier_dir_z": frontier_dir_z,
+            "frontier_dir_score": frontier_dir_score,
+            "recent_area_ratio": recent_area_ratio,
         }
 
     def get_feats(self, hero_pos):
@@ -115,6 +162,10 @@ class ExploreProcessor:
                 lookback_valid,
                 lookback_dx_norm,
                 lookback_dz_norm,
+                context["frontier_dir_x"],
+                context["frontier_dir_z"],
+                context["frontier_dir_score"],
+                context["recent_area_ratio"],
             ],
             dtype=np.float32,
         )
@@ -205,6 +256,18 @@ class ExploreProcessor:
         readiness_need = max(0.0, 0.58 - readiness_score) / 0.58
         return float(np.clip(0.65 * dead_end_need + 0.35 * readiness_need, 0.0, 1.0))
 
+    def calc_small_area_penalty(self, recent_area_ratio, danger_score) -> float:
+        if len(self.recent_grids) + 1 < RECENT_GRID_WINDOW // 2:
+            return 0.0
+
+        area_gap = max(0.0, RECENT_AREA_MIN_UNIQUE_RATIO - float(recent_area_ratio))
+        if area_gap <= 0.0:
+            return 0.0
+
+        area_gap_norm = area_gap / RECENT_AREA_MIN_UNIQUE_RATIO
+        safe_explore_weight = float(np.clip(1.0 - 0.45 * float(danger_score), 0.45, 1.0))
+        return -min(SMALL_AREA_PENALTY_SCALE * area_gap_norm * safe_explore_weight, SMALL_AREA_PENALTY_CAP)
+
     def calc_reward(self, hero_pos, step_no, danger_score, terrain_stats=None):
         context = self.get_context(hero_pos)
         grid = context["grid"]
@@ -271,6 +334,10 @@ class ExploreProcessor:
         lookback_valid, _, _, loop_dist = self.get_lookback_position_info(hero_pos)
         loop_ratio = max(0.0, LOOP_DISTANCE_THRESHOLD - loop_dist) / LOOP_DISTANCE_THRESHOLD
         window_loop_penalty = -LOOP_WINDOW_PENALTY * loop_ratio if lookback_valid > 0.0 else 0.0
+        small_area_penalty = self.calc_small_area_penalty(
+            recent_area_ratio=context["recent_area_ratio"],
+            danger_score=danger_score,
+        )
 
         self.visited_grid_counts[grid] = context["visit_count_after"]
         self.update_safety_memory(grid=grid, danger_score=danger_score, terrain_stats=terrain_stats)
@@ -287,6 +354,7 @@ class ExploreProcessor:
                 + no_progress_penalty
                 + local_loop_penalty
                 + window_loop_penalty
+                + small_area_penalty
             ),
             "explore_new_grid": int(explore_new_grid),
             "frontier_bonus": float(safe_explore_weight * frontier_bonus),
@@ -294,5 +362,7 @@ class ExploreProcessor:
             "no_progress_penalty": float(no_progress_penalty),
             "local_loop_penalty": float(local_loop_penalty),
             "window_loop_penalty": float(window_loop_penalty),
+            "small_area_penalty": float(small_area_penalty),
+            "recent_area_ratio": float(context["recent_area_ratio"]),
             "positioning_need": float(positioning_need),
         }

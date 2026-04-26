@@ -23,7 +23,7 @@ class Config:
         8,
         8,
         8,
-        6,
+        10,
         5,
         30,
         16,
@@ -43,9 +43,10 @@ class Config:
     TEMPORAL_WINDOW = 10
     TEMPORAL_FEATURE_LEN = FRAME_FEATURE_LEN * TEMPORAL_WINDOW
 
-    # Temporal encoder dims / 时序编码器维度
-    FRAME_EMBED_DIM = 128
-    TEMPORAL_HIDDEN_DIM = 128
+    # Network hidden dims / 网络隐藏层维度
+    HIDDEN_DIM = 256
+    FRAME_EMBED_DIM = 256
+    TEMPORAL_HIDDEN_DIM = 256
 
     # Backward-compatible aliases / 兼容旧配置名
     FEATURES = DENSE_FEATURES

@@ -2,6 +2,7 @@ import numpy as np
 
 
 MOVE_ACTION_NUM = 8
+MAX_MONSTER_SPEED = 5.0
 MAX_CLEARANCE_STEPS = 4.0
 FLASH_LOOKAHEAD_STEPS = (3, 4, 5)
 ROUTE_PLAN_MAX_DEPTH = 10
@@ -45,6 +46,13 @@ ESCAPE_WEIGHT_RANGE = 0.35
 
 # 逃跑方向和动作对齐奖励强度
 ESCAPE_ACTION_REWARD_SCALE = 0.12
+SPEEDUP_ESCAPE_WEIGHT_FLOOR = 0.55
+SPEEDUP_ROUTE_BLEND_BONUS = 0.25
+SPEEDUP_ROUTE_COMMIT_FLOOR = 0.50
+ESCAPE_STRAIGHT_REWARD_SCALE = 0.045
+ESCAPE_TURN_PENALTY_SCALE = 0.065
+ESCAPE_OSCILLATION_PENALTY_SCALE = 0.085
+ESCAPE_TURN_BETTER_MARGIN = 0.08
 FLASH_ACTION_REWARD_SCALE = 0.20
 FLASH_HIGH_QUALITY_BONUS_SCALE = 0.12
 FLASH_LOW_QUALITY_PENALTY_SCALE = 0.08
@@ -95,6 +103,8 @@ class TerrainProcessor:
         self.last_escape_dir_scores = None
         self.last_flash_dir_scores = None
         self.last_escape_weight = 0.0
+        self.prev_move_dir_idx = None
+        self.last_move_dir_idx = None
 
         # 连续贴墙停住的步数
         self.wall_stall_steps = 0
@@ -287,6 +297,18 @@ class TerrainProcessor:
                 1.0,
             )
         )
+
+    def calc_speedup_pressure(self, max_monster_speed=1) -> float:
+        max_monster_speed = float(max_monster_speed or 1)
+        if max_monster_speed <= 1.0:
+            return 0.0
+        return float(np.clip(0.55 + 0.15 * (max_monster_speed - 2.0), 0.0, 1.0))
+
+    def calc_route_commit_weight(self, danger_score, dead_end_risk, wall_pressure) -> float:
+        danger_weight = self.calc_escape_weight(danger_score)
+        dead_end_weight = max(0.0, float(dead_end_risk) - 0.25) / 0.75
+        wall_weight = max(0.0, float(wall_pressure) - 0.35) / 0.65
+        return float(np.clip(max(danger_weight, dead_end_weight, wall_weight), 0.0, 1.0))
 
     def calc_trap_risk(self, escape_ratio, wall_pressure, corner_pressure) -> float:
         low_escape_gap = max(0.0, LOW_ESCAPE_THRESHOLD - float(escape_ratio))
@@ -500,7 +522,16 @@ class TerrainProcessor:
         )
         return float(np.clip(dead_end_risk, 0.0, 1.0))
 
-    def extract_stats(self, map_info, move_mask, monster_vec=None, legal_action=None, hero_pos=None, future_monster_positions=None):
+    def extract_stats(
+        self,
+        map_info,
+        move_mask,
+        monster_vec=None,
+        legal_action=None,
+        hero_pos=None,
+        future_monster_positions=None,
+        max_monster_speed=1,
+    ):
         openness = self.calc_openness_ratio(map_info)
         escape_ratio = (
             float(sum(move_mask[:MOVE_ACTION_NUM])) / float(MOVE_ACTION_NUM)
@@ -531,12 +562,15 @@ class TerrainProcessor:
             hero_pos=hero_pos,
             future_monster_positions=future_monster_positions,
         )
+        speedup_pressure = self.calc_speedup_pressure(max_monster_speed=max_monster_speed)
+        route_blend = float(np.clip(0.40 + SPEEDUP_ROUTE_BLEND_BONUS * speedup_pressure, 0.40, 0.70))
+        base_blend = 1.0 - route_blend
         escape_dir_scores = [
-            float(np.clip(0.60 * base_score + 0.40 * route_score, 0.0, 1.0))
+            float(np.clip(base_blend * base_score + route_blend * route_score, 0.0, 1.0))
             for base_score, route_score in zip(base_escape_dir_scores, route_plan["move_route_scores"])
         ]
         flash_dir_scores = [
-            float(np.clip(0.60 * base_score + 0.40 * route_score, 0.0, 1.0))
+            float(np.clip(base_blend * base_score + route_blend * route_score, 0.0, 1.0))
             for base_score, route_score in zip(base_flash_dir_scores, route_plan["flash_route_scores"])
         ]
         route_diversity = self.calc_route_diversity(
@@ -572,6 +606,7 @@ class TerrainProcessor:
             "mean_route_score": route_plan["mean_route_score"],
             "safe_area_ratio": route_plan["safe_area_ratio"],
             "route_score_gap": route_plan["route_score_gap"],
+            "speedup_pressure": speedup_pressure,
             "clearances": clearances,
             "escape_dir_scores": escape_dir_scores,
             "flash_dir_scores": flash_dir_scores,
@@ -602,7 +637,7 @@ class TerrainProcessor:
             dtype=np.float32,
         )
 
-    def calc_reward(self, hero_pos, terrain_stats, last_action, danger_score) -> float:
+    def calc_reward(self, hero_pos, terrain_stats, last_action, danger_score, max_monster_speed=1) -> float:
         openness = terrain_stats["openness"]
         escape_ratio = terrain_stats["escape_ratio"]
         avg_clearance = terrain_stats["avg_clearance"]
@@ -613,8 +648,18 @@ class TerrainProcessor:
         escape_dir_scores = terrain_stats["escape_dir_scores"]
         flash_dir_scores = terrain_stats["flash_dir_scores"]
 
-        preemptive_weight = float(max(0.6, 1.0 - 0.5 * float(np.clip(danger_score, 0.0, 1.0))))
-        escape_weight = self.calc_escape_weight(danger_score)
+        speedup_pressure = self.calc_speedup_pressure(max_monster_speed=max_monster_speed)
+        preemptive_weight = float(
+            max(
+                0.6,
+                0.62 + 0.20 * speedup_pressure,
+                1.0 - 0.5 * float(np.clip(danger_score, 0.0, 1.0)),
+            )
+        )
+        escape_weight = max(
+            self.calc_escape_weight(danger_score),
+            SPEEDUP_ESCAPE_WEIGHT_FLOOR * speedup_pressure,
+        )
         reward = 0.0
 
         if self.last_openness is not None:
@@ -655,9 +700,37 @@ class TerrainProcessor:
             if 0 <= action_idx < MOVE_ACTION_NUM:
                 dir_idx = action_idx % MOVE_ACTION_NUM
                 mean_escape_score = float(np.mean(self.last_escape_dir_scores))
+                action_escape_score = float(self.last_escape_dir_scores[dir_idx])
                 reward += self.last_escape_weight * ESCAPE_ACTION_REWARD_SCALE * (
-                    float(self.last_escape_dir_scores[dir_idx]) - mean_escape_score
+                    action_escape_score - mean_escape_score
                 )
+
+                route_commit_weight = max(
+                    self.last_escape_weight,
+                    self.calc_route_commit_weight(danger_score, dead_end_risk, wall_pressure),
+                    SPEEDUP_ROUTE_COMMIT_FLOOR * speedup_pressure,
+                )
+                if route_commit_weight > 0.0 and self.last_move_dir_idx is not None:
+                    last_dir_idx = int(self.last_move_dir_idx)
+                    last_dir_score = float(self.last_escape_dir_scores[last_dir_idx])
+                    turn_dot = float(np.clip(np.dot(MOVE_VECS[dir_idx], MOVE_VECS[last_dir_idx]), -1.0, 1.0))
+                    turn_cost = 0.5 * (1.0 - turn_dot)
+
+                    if turn_cost <= 0.16 and action_escape_score >= mean_escape_score:
+                        reward += route_commit_weight * ESCAPE_STRAIGHT_REWARD_SCALE * (
+                            action_escape_score - mean_escape_score
+                        )
+                    elif action_escape_score <= last_dir_score + ESCAPE_TURN_BETTER_MARGIN:
+                        reward -= route_commit_weight * ESCAPE_TURN_PENALTY_SCALE * turn_cost
+
+                    is_oscillating = (
+                        self.prev_move_dir_idx is not None
+                        and int(self.prev_move_dir_idx) == dir_idx
+                        and last_dir_idx != dir_idx
+                        and action_escape_score <= last_dir_score + ESCAPE_TURN_BETTER_MARGIN
+                    )
+                    if is_oscillating:
+                        reward -= route_commit_weight * ESCAPE_OSCILLATION_PENALTY_SCALE * (0.5 + turn_cost)
             elif MOVE_ACTION_NUM <= action_idx < MOVE_ACTION_NUM * 2 and self.last_flash_dir_scores is not None:
                 dir_idx = action_idx % MOVE_ACTION_NUM
                 flash_score = float(self.last_flash_dir_scores[dir_idx])
@@ -725,4 +798,12 @@ class TerrainProcessor:
         self.last_escape_dir_scores = np.array(escape_dir_scores, dtype=np.float32)
         self.last_flash_dir_scores = np.array(flash_dir_scores, dtype=np.float32)
         self.last_escape_weight = escape_weight
+        if last_action is not None:
+            action_idx = int(last_action)
+            if 0 <= action_idx < MOVE_ACTION_NUM:
+                self.prev_move_dir_idx = self.last_move_dir_idx
+                self.last_move_dir_idx = action_idx % MOVE_ACTION_NUM
+            elif MOVE_ACTION_NUM <= action_idx < MOVE_ACTION_NUM * 2:
+                self.prev_move_dir_idx = None
+                self.last_move_dir_idx = None
         return reward

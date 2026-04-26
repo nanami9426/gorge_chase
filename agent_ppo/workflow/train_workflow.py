@@ -39,29 +39,41 @@ PHASE_LOG_ORDER = [
 CURRICULUM_STAGE_CONFIG = {
     CURRICULUM_SURVIVAL_BOOTSTRAP: {
         "env_overrides": {
-            "treasure_count": 6,
+            "treasure_count": 10,
             "buff_count": 2,
-            "monster_interval": 500,
-            "monster_speedup": 700,
+            "monster_interval": 650,
+            "monster_speedup": 520,
             "max_step": 2000,
         },
-        "loot_reward_scale": 0.70,
+        "env_schedule": {
+            "monster_interval": (650, 420, 120),
+            "monster_speedup": (520, 260, 120),
+        },
+        "loot_reward_scale": 0.90,
     },
     CURRICULUM_LOOT_UNLOCK: {
         "env_overrides": {
             "buff_count": 2,
-            "monster_interval": 340,
-            "monster_speedup": 560,
+            "monster_interval": 480,
+            "monster_speedup": 300,
             "max_step": 2000,
+        },
+        "env_schedule": {
+            "monster_interval": (480, 340, 80),
+            "monster_speedup": (300, 160, 80),
         },
         "loot_reward_scale": 1.25,
     },
     CURRICULUM_FULL: {
         "env_overrides": {
             "buff_count": 2,
-            "monster_interval": 300,
-            "monster_speedup": 500,
+            "monster_interval": 340,
+            "monster_speedup": 180,
             "max_step": 2000,
+        },
+        "env_schedule": {
+            "monster_interval": (340, 300, 60),
+            "monster_speedup": (180, 100, 60),
         },
         "loot_reward_scale": 1.15,
     },
@@ -103,6 +115,13 @@ def build_aux_target(remain_info):
         ],
         dtype=np.float32,
     )
+
+
+def linear_int_schedule(start, end, warmup_episodes, episode_idx):
+    warmup_episodes = max(int(warmup_episodes), 1)
+    episode_idx = max(int(episode_idx), 0)
+    ratio = float(np.clip(float(episode_idx) / float(warmup_episodes), 0.0, 1.0))
+    return int(round(float(start) + (float(end) - float(start)) * ratio))
 
 
 class CurriculumTracker:
@@ -217,6 +236,15 @@ def build_episode_usr_conf(
         CURRICULUM_STAGE_CONFIG[CURRICULUM_SURVIVAL_BOOTSTRAP],
     )
     env_conf.update(deepcopy(stage_conf.get("env_overrides", {})))
+    for key, schedule in stage_conf.get("env_schedule", {}).items():
+        if len(schedule) != 3:
+            continue
+        env_conf[key] = linear_int_schedule(
+            start=schedule[0],
+            end=schedule[1],
+            warmup_episodes=schedule[2],
+            episode_idx=stage_episode_idx,
+        )
     return episode_usr_conf
 
 
@@ -380,6 +408,7 @@ class EpisodeRunner:
                     "action_prior_sum",
                     "best_route_score",
                     "safe_area_ratio",
+                    "speedup_pressure",
                     "treasure_priority",
                 ):
                     risk_metric_sum[key] += float(_remain_info.get(key, 0.0))
@@ -390,6 +419,8 @@ class EpisodeRunner:
                     "no_progress_penalty",
                     "local_loop_penalty",
                     "window_loop_penalty",
+                    "small_area_penalty",
+                    "recent_area_ratio",
                     "positioning_need",
                     "buff_priority_weight",
                     "available_treasure_count",
@@ -474,6 +505,14 @@ class EpisodeRunner:
                         behavior_metric_sum.get("window_loop_penalty", 0.0) / max(step, 1),
                         4,
                     )
+                    small_area_penalty_mean = round(
+                        behavior_metric_sum.get("small_area_penalty", 0.0) / max(step, 1),
+                        4,
+                    )
+                    recent_area_ratio_mean = round(
+                        behavior_metric_sum.get("recent_area_ratio", 0.0) / max(step, 1),
+                        4,
+                    )
                     positioning_need_mean = round(
                         behavior_metric_sum.get("positioning_need", 0.0) / max(step, 1),
                         4,
@@ -524,6 +563,8 @@ class EpisodeRunner:
                         f"no_progress_penalty_mean:{no_progress_penalty_mean} "
                         f"local_loop_penalty_mean:{local_loop_penalty_mean} "
                         f"window_loop_penalty_mean:{window_loop_penalty_mean} "
+                        f"small_area_penalty_mean:{small_area_penalty_mean} "
+                        f"recent_area_ratio_mean:{recent_area_ratio_mean} "
                         f"positioning_need_mean:{positioning_need_mean} "
                         f"buff_priority_weight_mean:{buff_priority_weight_mean} "
                         f"available_buff_count_mean:{available_buff_count_mean} "

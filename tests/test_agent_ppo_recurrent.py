@@ -285,8 +285,37 @@ class RecurrentPPOTests(unittest.TestCase):
         loop_feat = explore_processor.get_feats(hero_pos)
 
         self.assertLess(reward_info["window_loop_penalty"], 0.0)
-        self.assertEqual(loop_feat.shape, (6,))
+        self.assertEqual(loop_feat.shape, (10,))
         self.assertEqual(float(loop_feat[3]), 1.0)
+
+    def test_explore_penalizes_recent_small_area(self):
+        explore_processor = ExploreProcessor()
+        terrain_stats = {"dead_end_risk": 0.1, "readiness_score": 0.8}
+
+        reward_info = None
+        for step_idx in range(12):
+            hero_pos = {"x": 10 + 4 * (step_idx % 2), "z": 10}
+            reward_info = explore_processor.calc_reward(
+                hero_pos=hero_pos,
+                step_no=step_idx,
+                danger_score=0.1,
+                terrain_stats=terrain_stats,
+            )
+
+        self.assertLess(reward_info["small_area_penalty"], 0.0)
+        self.assertLess(reward_info["recent_area_ratio"], 0.35)
+
+    def test_explore_frontier_feature_points_to_low_visit_neighbor(self):
+        explore_processor = ExploreProcessor()
+        explore_processor.visited_grid_counts[(4, 4)] = 3
+        explore_processor.visited_grid_counts[(5, 4)] = 4
+        explore_processor.visited_grid_counts[(4, 5)] = 4
+
+        explore_feat = explore_processor.get_feats({"x": 16, "z": 16})
+
+        self.assertEqual(explore_feat.shape, (10,))
+        self.assertGreater(float(explore_feat[8]), 0.0)
+        self.assertGreater(abs(float(explore_feat[6])) + abs(float(explore_feat[7])), 0.0)
 
     def test_speedup_critical_prune_keeps_best_escape_actions(self):
         preprocessor = Preprocessor()
@@ -306,6 +335,28 @@ class RecurrentPPOTests(unittest.TestCase):
         self.assertGreater(pruned_count, 0)
         self.assertEqual(masked_action[0], 1)
         self.assertEqual(masked_action[8], 1)
+        self.assertEqual(masked_action[6], 0)
+
+    def test_speedup_critical_prune_starts_before_close_danger_in_bad_position(self):
+        preprocessor = Preprocessor()
+        legal_action = [1] * Config.ACTION_NUM
+        terrain_stats = {
+            "escape_dir_scores": [0.1, 0.2, 0.92, 0.8, 0.1, 0.05, 0.0, 0.2],
+            "flash_dir_scores": [0.2, 0.3, 0.88, 0.4, 0.1, 0.05, 0.0, 0.2],
+            "dead_end_risk": 0.45,
+            "readiness_score": 0.45,
+        }
+
+        masked_action, pruned_count = preprocessor.prune_critical_escape_actions(
+            legal_action=legal_action,
+            terrain_stats=terrain_stats,
+            danger_score=0.38,
+            max_monster_speed=2,
+        )
+
+        self.assertGreater(pruned_count, 0)
+        self.assertEqual(masked_action[2], 1)
+        self.assertEqual(masked_action[10], 1)
         self.assertEqual(masked_action[6], 0)
 
     def test_action_prior_prefers_flash_and_buff_under_speedup_risk(self):
@@ -338,6 +389,72 @@ class RecurrentPPOTests(unittest.TestCase):
 
         self.assertGreater(action_prior[12], action_prior[0])
         self.assertGreater(action_prior[8 + 4], 0.5)
+
+    def test_action_prior_suppresses_treasure_when_speedup_escape_is_risky(self):
+        preprocessor = Preprocessor()
+        legal_action = [1] * Config.ACTION_NUM
+        terrain_stats = {
+            "escape_dir_scores": [0.10, 0.20, 0.25, 0.35, 0.95, 0.45, 0.30, 0.20],
+            "flash_dir_scores": [0.2] * 8,
+            "dead_end_risk": 0.45,
+            "readiness_score": 0.45,
+            "route_diversity": 0.35,
+            "best_flash_score": 0.20,
+        }
+        organs_feat = np.array(
+            [
+                1.0, 0.18, 1.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+            ],
+            dtype=np.float32,
+        )
+        treasure_priority_feat = np.array([1.0, 0.18, 1.0, 0.0, 0.85, 0.0, 0.5, 0.8], dtype=np.float32)
+
+        action_prior = preprocessor.build_action_prior(
+            legal_action=legal_action,
+            terrain_stats=terrain_stats,
+            organs_feat=organs_feat,
+            hero={"buff_remaining_time": 0.0},
+            danger_score=0.46,
+            max_monster_speed=2,
+            treasure_priority_feat=treasure_priority_feat,
+        )
+
+        self.assertGreater(action_prior[4], action_prior[0])
+        self.assertGreater(action_prior[4], 0.55)
+
+    def test_action_prior_keeps_treasure_when_it_is_on_speedup_escape_route(self):
+        preprocessor = Preprocessor()
+        legal_action = [1] * Config.ACTION_NUM
+        terrain_stats = {
+            "escape_dir_scores": [0.92, 0.82, 0.40, 0.30, 0.10, 0.20, 0.25, 0.70],
+            "flash_dir_scores": [0.2] * 8,
+            "dead_end_risk": 0.45,
+            "readiness_score": 0.45,
+            "route_diversity": 0.35,
+            "best_flash_score": 0.20,
+        }
+        organs_feat = np.array(
+            [
+                1.0, 0.18, 1.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+            ],
+            dtype=np.float32,
+        )
+        treasure_priority_feat = np.array([1.0, 0.18, 1.0, 0.0, 0.85, 1.0, 0.5, 0.8], dtype=np.float32)
+
+        action_prior = preprocessor.build_action_prior(
+            legal_action=legal_action,
+            terrain_stats=terrain_stats,
+            organs_feat=organs_feat,
+            hero={"buff_remaining_time": 0.0},
+            danger_score=0.50,
+            max_monster_speed=2,
+            treasure_priority_feat=treasure_priority_feat,
+        )
+
+        self.assertGreater(action_prior[0], 0.80)
+        self.assertGreater(action_prior[0], action_prior[4])
 
     def test_action_prior_keeps_treasure_target_under_moderate_danger(self):
         preprocessor = Preprocessor()
@@ -416,6 +533,46 @@ class RecurrentPPOTests(unittest.TestCase):
         )
 
         self.assertGreater(reward, 0.0)
+
+    def test_speedup_flash_allowed_before_regular_danger_threshold(self):
+        flash_processor = FlashProcessor()
+        terrain_stats = {
+            "dead_end_risk": 0.34,
+            "readiness_score": 0.48,
+            "best_flash_score": 0.62,
+        }
+
+        self.assertFalse(
+            flash_processor.should_allow_flash(
+                danger_score=0.43,
+                terrain_stats=terrain_stats,
+                max_monster_speed=1,
+            )
+        )
+        self.assertTrue(
+            flash_processor.should_allow_flash(
+                danger_score=0.43,
+                terrain_stats=terrain_stats,
+                max_monster_speed=2,
+            )
+        )
+
+    def test_prediction_pressure_raises_speedup_danger(self):
+        flash_processor = FlashProcessor()
+        monster_feats = [np.array([1.0, 1.0, 0.0, 0.4, 0.35], dtype=np.float32)]
+        terrain_stats = {"trap_risk": 0.1, "readiness_score": 0.7}
+
+        base_danger = flash_processor.calc_danger_score(
+            monster_feats=monster_feats,
+            terrain_stats=terrain_stats,
+        )
+        predicted_danger = flash_processor.calc_danger_score(
+            monster_feats=monster_feats,
+            terrain_stats=terrain_stats,
+            prediction_feat=np.array([1.0, 0.8, 0.75, 0.80, 0.85, 0.85], dtype=np.float32),
+        )
+
+        self.assertGreater(predicted_danger, base_danger)
 
     def test_strategic_flash_not_penalized_when_dead_end_escape_exists(self):
         flash_processor = FlashProcessor()
@@ -543,6 +700,25 @@ class RecurrentPPOTests(unittest.TestCase):
             survival_conf["env_conf"]["treasure_count"],
             CURRICULUM_STAGE_CONFIG[CURRICULUM_SURVIVAL_BOOTSTRAP]["env_overrides"]["treasure_count"],
         )
+
+    def test_build_episode_usr_conf_warms_up_speedup_pressure(self):
+        base_usr_conf = {"env_conf": {"treasure_count": 10}}
+
+        early_conf = build_episode_usr_conf(
+            base_usr_conf=base_usr_conf,
+            curriculum_stage=CURRICULUM_SURVIVAL_BOOTSTRAP,
+            stage_episode_idx=0,
+        )
+        late_conf = build_episode_usr_conf(
+            base_usr_conf=base_usr_conf,
+            curriculum_stage=CURRICULUM_SURVIVAL_BOOTSTRAP,
+            stage_episode_idx=120,
+        )
+
+        self.assertEqual(early_conf["env_conf"]["monster_speedup"], 520)
+        self.assertEqual(early_conf["env_conf"]["monster_interval"], 650)
+        self.assertEqual(late_conf["env_conf"]["monster_speedup"], 260)
+        self.assertEqual(late_conf["env_conf"]["monster_interval"], 420)
 
     def test_build_episode_usr_conf_preserves_loot_treasure_count(self):
         base_usr_conf = {"env_conf": {"treasure_count": 10, "map_random": False}}
@@ -795,6 +971,49 @@ class RecurrentPPOTests(unittest.TestCase):
         self.assertGreater(route_plan["move_route_scores"][4], route_plan["move_route_scores"][0])
         self.assertGreater(route_plan["best_route_score"], 0.0)
         self.assertGreater(route_plan["safe_area_ratio"], 0.0)
+
+    def test_escape_reward_discourages_zigzag_when_route_quality_is_similar(self):
+        terrain_stats = {
+            "openness": 0.60,
+            "escape_ratio": 0.75,
+            "avg_clearance": 0.70,
+            "wall_pressure": 0.50,
+            "corner_pressure": 0.20,
+            "readiness_score": 0.70,
+            "dead_end_risk": 0.35,
+            "escape_dir_scores": [0.88, 0.90, 0.30, 0.20, 0.10, 0.20, 0.30, 0.80],
+            "flash_dir_scores": [0.20] * 8,
+        }
+
+        straight_processor = TerrainProcessor()
+        straight_processor.last_escape_dir_scores = np.array(terrain_stats["escape_dir_scores"], dtype=np.float32)
+        straight_processor.last_flash_dir_scores = np.array(terrain_stats["flash_dir_scores"], dtype=np.float32)
+        straight_processor.last_escape_weight = 1.0
+        straight_processor.prev_move_dir_idx = 0
+        straight_processor.last_move_dir_idx = 1
+        straight_processor.last_hero_pos = (0, 0)
+        straight_reward = straight_processor.calc_reward(
+            hero_pos={"x": 1, "z": 1},
+            terrain_stats=terrain_stats,
+            last_action=1,
+            danger_score=0.80,
+        )
+
+        zigzag_processor = TerrainProcessor()
+        zigzag_processor.last_escape_dir_scores = np.array(terrain_stats["escape_dir_scores"], dtype=np.float32)
+        zigzag_processor.last_flash_dir_scores = np.array(terrain_stats["flash_dir_scores"], dtype=np.float32)
+        zigzag_processor.last_escape_weight = 1.0
+        zigzag_processor.prev_move_dir_idx = 0
+        zigzag_processor.last_move_dir_idx = 1
+        zigzag_processor.last_hero_pos = (0, 0)
+        zigzag_reward = zigzag_processor.calc_reward(
+            hero_pos={"x": 1, "z": 0},
+            terrain_stats=terrain_stats,
+            last_action=0,
+            danger_score=0.80,
+        )
+
+        self.assertGreater(straight_reward, zigzag_reward)
 
     def test_treasure_priority_damps_under_high_danger(self):
         processor = OrganProcessor()
