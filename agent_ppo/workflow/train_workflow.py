@@ -397,6 +397,10 @@ class EpisodeRunner:
                     "known_treasure_count",
                     "known_buff_count",
                     "first_seen_treasure_count",
+                    "treasure_bfs_dist_norm",
+                    "buff_bfs_dist_norm",
+                    "treasure_bfs_progress",
+                    "buff_bfs_progress",
                     "nearest_buff_dist_norm",
                 ):
                     behavior_metric_sum[key] += float(_remain_info.get(key, 0.0))
@@ -490,6 +494,22 @@ class EpisodeRunner:
                         behavior_metric_sum.get("known_treasure_count", 0.0) / max(step, 1),
                         4,
                     )
+                    treasure_bfs_dist_mean = round(
+                        behavior_metric_sum.get("treasure_bfs_dist_norm", 0.0) / max(step, 1),
+                        4,
+                    )
+                    buff_bfs_dist_mean = round(
+                        behavior_metric_sum.get("buff_bfs_dist_norm", 0.0) / max(step, 1),
+                        4,
+                    )
+                    treasure_bfs_progress_mean = round(
+                        behavior_metric_sum.get("treasure_bfs_progress", 0.0) / max(step, 1),
+                        4,
+                    )
+                    buff_bfs_progress_mean = round(
+                        behavior_metric_sum.get("buff_bfs_progress", 0.0) / max(step, 1),
+                        4,
+                    )
                     first_seen_treasure_count = int(
                         round(behavior_metric_sum.get("first_seen_treasure_count", 0.0))
                     )
@@ -509,6 +529,10 @@ class EpisodeRunner:
                         f"available_buff_count_mean:{available_buff_count_mean} "
                         f"nearest_buff_dist_mean:{nearest_buff_dist_mean} "
                         f"known_treasure_count_mean:{known_treasure_count_mean} "
+                        f"treasure_bfs_dist_mean:{treasure_bfs_dist_mean} "
+                        f"buff_bfs_dist_mean:{buff_bfs_dist_mean} "
+                        f"treasure_bfs_progress_mean:{treasure_bfs_progress_mean} "
+                        f"buff_bfs_progress_mean:{buff_bfs_progress_mean} "
                         f"first_seen_treasure_count:{first_seen_treasure_count} "
                         f"curriculum_stage:{curriculum_stage}"
                     )

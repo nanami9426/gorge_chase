@@ -10,6 +10,7 @@ Feature preprocessor and reward design for Gorge Chase PPO.
 峡谷追猎 PPO 特征预处理与奖励设计。
 """
 import numpy as np
+from collections import deque
 
 from agent_ppo.feature.rewards import OrganProcessor
 from agent_ppo.feature.rewards import ExploreProcessor
@@ -19,6 +20,7 @@ from agent_ppo.feature.rewards import MoveProcessor
 from agent_ppo.feature.rewards import PhaseProcessor
 from agent_ppo.feature.rewards.phase_processor import CURRICULUM_LOOT_UNLOCK
 from agent_ppo.feature.rewards import TerrainProcessor
+from agent_ppo.feature.rewards.terrain_processor import MOVE_DIRS
 from agent_ppo.feature.rewards.terrain_processor import MOVE_VECS
 from agent_ppo.feature.spatial_encoder import SpatialFeatureEncoder
 
@@ -48,6 +50,7 @@ ACTION_PRIOR_BAD_TERRAIN_START = 0.35
 ACTION_PRIOR_SAFE_TREASURE_DANGER = 0.58
 ACTION_PRIOR_SAFE_TREASURE_READINESS = 0.45
 ACTION_PRIOR_CRITICAL_LOOT_DANGER = 0.88
+BFS_ROUTE_DIST_NORM_CAP = 30.0
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -199,6 +202,143 @@ class Preprocessor:
         if 0 <= action_idx < 8 and legal_action[action_idx] == 1:
             action_prior[action_idx] = max(action_prior[action_idx], float(weight))
 
+    def calc_bfs_route(self, map_info, target_cell):
+        if (
+            map_info is None
+            or not map_info
+            or not map_info[0]
+            or target_cell is None
+        ):
+            return None
+
+        start_row = len(map_info) // 2
+        start_col = len(map_info[0]) // 2
+        target_row, target_col = target_cell
+        if not self.terrain_processor.is_cell_passable(map_info, start_row, start_col):
+            return None
+        if not self.terrain_processor.is_cell_passable(map_info, target_row, target_col):
+            return None
+
+        if start_row == target_row and start_col == target_col:
+            return {"dist": 0, "first_action": None}
+
+        visited = {(start_row, start_col)}
+        queue = deque()
+        for action_idx, (dr, dc) in enumerate(MOVE_DIRS):
+            row = start_row + dr
+            col = start_col + dc
+            if not self.terrain_processor.is_cell_passable(map_info, row, col):
+                continue
+            visited.add((row, col))
+            queue.append((row, col, 1, action_idx))
+
+        while queue:
+            row, col, dist, first_action = queue.popleft()
+            if row == target_row and col == target_col:
+                return {"dist": dist, "first_action": first_action}
+
+            for dr, dc in MOVE_DIRS:
+                next_row = row + dr
+                next_col = col + dc
+                next_cell = (next_row, next_col)
+                if next_cell in visited or not self.terrain_processor.is_cell_passable(map_info, next_row, next_col):
+                    continue
+                visited.add(next_cell)
+                queue.append((next_row, next_col, dist + 1, first_action))
+
+        return None
+
+    def empty_route_target(self):
+        return {
+            "has": 0.0,
+            "dist_norm": 1.0,
+            "dir_x": 0.0,
+            "dir_z": 0.0,
+            "key": None,
+            "memory_key": None,
+            "from_memory": False,
+            "dist": None,
+        }
+
+    def encode_route_target(self, target_info):
+        return np.array(
+            [
+                float(target_info.get("has", 0.0)),
+                float(target_info.get("dist_norm", 1.0)),
+                float(target_info.get("dir_x", 0.0)),
+                float(target_info.get("dir_z", 0.0)),
+            ],
+            dtype=np.float32,
+        )
+
+    def select_bfs_target(self, map_info, hero_pos, candidates, sub_type):
+        best_item = None
+        for organ in candidates:
+            if int(organ.get("sub_type", 0)) != int(sub_type):
+                continue
+            target_cell = self.terrain_processor.project_world_pos_to_local_cell(
+                organ.get("pos"),
+                hero_pos,
+                map_info,
+            )
+            route = self.calc_bfs_route(map_info, target_cell)
+            if route is None:
+                continue
+
+            dist = int(route["dist"])
+            first_action = route["first_action"]
+            if first_action is None:
+                dir_x, dir_z = 0.0, 0.0
+            else:
+                dir_x, dir_z = MOVE_VECS[first_action]
+
+            from_memory = bool(organ.get("from_memory", False))
+            candidate_info = {
+                "has": 1.0,
+                "dist_norm": float(np.clip(dist / BFS_ROUTE_DIST_NORM_CAP, 0.0, 1.0)),
+                "dir_x": float(dir_x),
+                "dir_z": float(dir_z),
+                "key": organ.get("key"),
+                "memory_key": organ.get("memory_key"),
+                "from_memory": from_memory,
+                "dist": dist,
+            }
+            sort_key = (dist, 1 if from_memory else 0)
+            if best_item is None or sort_key < best_item[0]:
+                best_item = (sort_key, candidate_info)
+
+        return self.empty_route_target() if best_item is None else best_item[1]
+
+    def build_bfs_route_targets(self, map_info, hero_pos, organs):
+        available_organs = self.organ_processor.build_available_organs(organs, hero_pos)
+        self.organ_processor.update_memory_from_available(available_organs)
+        cached_organs = self.organ_processor.build_cached_organs(hero_pos)
+
+        candidates_by_key = {}
+        for organ in cached_organs:
+            organ = dict(organ)
+            organ["from_memory"] = True
+            candidates_by_key[organ.get("memory_key")] = organ
+        for organ in available_organs:
+            organ = dict(organ)
+            organ["from_memory"] = False
+            candidates_by_key[organ.get("memory_key")] = organ
+
+        candidates = list(candidates_by_key.values())
+        treasure_route = self.select_bfs_target(map_info, hero_pos, candidates, sub_type=1)
+        buff_route = self.select_bfs_target(map_info, hero_pos, candidates, sub_type=2)
+        route_info = {
+            "treasure": treasure_route,
+            "buff": buff_route,
+        }
+        route_feat = np.concatenate(
+            [
+                self.encode_route_target(treasure_route),
+                self.encode_route_target(buff_route),
+            ]
+        )
+        return route_feat.astype(np.float32), route_info
+
     def build_action_prior(
         self,
         legal_action,
@@ -208,6 +348,7 @@ class Preprocessor:
         danger_score,
         max_monster_speed,
         cached_organs_feat=None,
+        target_route_feat=None,
         treasure_priority_feat=None,
     ):
         legal_action = list(legal_action)
@@ -259,6 +400,13 @@ class Preprocessor:
         )
         cached_treasure_feat = cached_organs_feat[:4]
         cached_buff_feat = cached_organs_feat[4:8]
+        target_route_feat = (
+            np.asarray(target_route_feat, dtype=np.float32)
+            if target_route_feat is not None
+            else np.zeros(8, dtype=np.float32)
+        )
+        route_treasure_feat = target_route_feat[:4]
+        route_buff_feat = target_route_feat[4:8]
         treasure_priority_feat = (
             np.asarray(treasure_priority_feat, dtype=np.float32)
             if treasure_priority_feat is not None
@@ -269,7 +417,9 @@ class Preprocessor:
         priority_weight = float(np.clip(treasure_priority_feat[4], 0.0, 1.0)) if priority_has_target else 0.0
         priority_safe = priority_has_target and float(treasure_priority_feat[5]) > 0.0
 
-        buff_target_feat = buff_feat if float(buff_feat[0]) > 0.0 else cached_buff_feat
+        buff_target_feat = route_buff_feat if float(route_buff_feat[0]) > 0.0 else buff_feat
+        if float(buff_target_feat[0]) <= 0.0:
+            buff_target_feat = cached_buff_feat
         buff_from_memory = float(buff_feat[0]) <= 0.0 and float(cached_buff_feat[0]) > 0.0
         if float(buff_target_feat[0]) > 0.0:
             buff_dist = float(np.clip(buff_target_feat[1], 0.0, 1.0))
@@ -301,10 +451,14 @@ class Preprocessor:
             and dead_end_risk <= 0.35
         )
         critical_escape = danger_score >= ACTION_PRIOR_CRITICAL_LOOT_DANGER and escape_need >= 0.65
-        treasure_target_available = float(treasure_feat[0]) > 0.0 or float(cached_treasure_feat[0]) > 0.0
+        treasure_target_available = (
+            float(route_treasure_feat[0]) > 0.0
+            or float(treasure_feat[0]) > 0.0
+            or float(cached_treasure_feat[0]) > 0.0
+        )
         if treasure_target_available and not critical_escape:
-            target_feat = treasure_feat
-            if priority_has_target:
+            target_feat = route_treasure_feat if float(route_treasure_feat[0]) > 0.0 else treasure_feat
+            if priority_has_target and float(route_treasure_feat[0]) <= 0.0:
                 target_feat = np.array(
                     [
                         treasure_priority_feat[0],
@@ -445,6 +599,11 @@ class Preprocessor:
             terrain_stats=terrain_stats,
             danger_score=danger_score,
         )
+        target_route_feat, target_route_info = self.build_bfs_route_targets(
+            map_info=map_info_for_logic,
+            hero_pos=hero_pos,
+            organs=organs,
+        )
         memory_feat = self.explore_processor.get_memory_feats(hero_pos=hero_pos)
         legal_action, critical_pruned_actions = self.prune_critical_escape_actions(
             legal_action=legal_action,
@@ -463,6 +622,7 @@ class Preprocessor:
             terrain_stats=terrain_stats,
             organs_feat=organs_feat,
             cached_organs_feat=cached_organs_feat,
+            target_route_feat=target_route_feat,
             hero=hero,
             danger_score=danger_score,
             max_monster_speed=max_monster_speed,
@@ -482,6 +642,7 @@ class Preprocessor:
                 monster_prediction_feat,
                 organs_feat,
                 cached_organs_feat,
+                target_route_feat,
                 treasure_priority_feat,
                 explore_feat,
                 memory_feat,
@@ -508,6 +669,7 @@ class Preprocessor:
             hero=hero,
             terrain_stats=terrain_stats,
             danger_score=danger_score,
+            route_info=target_route_info,
         )
         progress_reward = self.calc_progress_reward(env_info=env_info)
         if monster_count >= 2:
@@ -578,6 +740,8 @@ class Preprocessor:
             "action_prior_sum": float(np.sum(action_prior)),
             "treasure_priority": float(treasure_priority_feat[4]),
             "safe_to_loot": float(treasure_priority_feat[5]),
+            "treasure_bfs_dist_norm": float(target_route_info["treasure"]["dist_norm"]),
+            "buff_bfs_dist_norm": float(target_route_info["buff"]["dist_norm"]),
             "explore_new_grid": int(explore_reward_info["explore_new_grid"]),
             "frontier_bonus": float(explore_reward_info["frontier_bonus"]),
             "explore_streak_bonus": float(explore_reward_info["explore_streak_bonus"]),
@@ -593,6 +757,8 @@ class Preprocessor:
             "known_treasure_count": int(organ_reward["known_treasure_count"]),
             "known_buff_count": int(organ_reward["known_buff_count"]),
             "first_seen_treasure_count": int(organ_reward["first_seen_treasure_count"]),
+            "treasure_bfs_progress": float(organ_reward["treasure_bfs_progress"]),
+            "buff_bfs_progress": float(organ_reward["buff_bfs_progress"]),
             "nearest_buff_dist_norm": float(organ_reward["nearest_buff_dist_norm"]),
             "reward_breakdown": {
                 "raw": raw_reward_breakdown,

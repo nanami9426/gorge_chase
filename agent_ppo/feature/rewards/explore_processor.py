@@ -269,11 +269,8 @@ class ExploreProcessor:
             LOCAL_LOOP_PENALTY_CAP,
         )
         lookback_valid, _, _, loop_dist = self.get_lookback_position_info(hero_pos)
-        window_loop_penalty = (
-            -LOOP_WINDOW_PENALTY
-            if lookback_valid > 0.0 and loop_dist < LOOP_DISTANCE_THRESHOLD
-            else 0.0
-        )
+        loop_ratio = max(0.0, LOOP_DISTANCE_THRESHOLD - loop_dist) / LOOP_DISTANCE_THRESHOLD
+        window_loop_penalty = -LOOP_WINDOW_PENALTY * loop_ratio if lookback_valid > 0.0 else 0.0
 
         self.visited_grid_counts[grid] = context["visit_count_after"]
         self.update_safety_memory(grid=grid, danger_score=danger_score, terrain_stats=terrain_stats)

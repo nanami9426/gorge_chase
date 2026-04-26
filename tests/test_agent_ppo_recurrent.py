@@ -372,6 +372,36 @@ class RecurrentPPOTests(unittest.TestCase):
         self.assertGreater(action_prior[0], 0.65)
         self.assertGreater(action_prior[0], action_prior[2])
 
+    def test_bfs_route_feature_uses_walkable_first_step(self):
+        preprocessor = Preprocessor()
+        hero_pos = {"x": 10, "z": 10}
+        organs = [
+            {
+                "status": 1,
+                "sub_type": 1,
+                "config_id": 1,
+                "hero_relative_direction": 1,
+                "pos": {"x": 13, "z": 10},
+            }
+        ]
+        open_map = np.ones((21, 21), dtype=np.int32)
+
+        route_feat, route_info = preprocessor.build_bfs_route_targets(open_map.tolist(), hero_pos, organs)
+
+        self.assertEqual(route_feat.shape, (8,))
+        self.assertEqual(float(route_feat[0]), 1.0)
+        self.assertAlmostEqual(float(route_feat[2]), 1.0)
+        self.assertAlmostEqual(float(route_feat[3]), 0.0)
+        self.assertEqual(route_info["treasure"]["dist"], 3)
+
+        blocked_map = open_map.copy()
+        blocked_map[10, 11] = 0
+        blocked_feat, blocked_info = preprocessor.build_bfs_route_targets(blocked_map.tolist(), hero_pos, organs)
+
+        self.assertEqual(float(blocked_feat[0]), 1.0)
+        self.assertNotAlmostEqual(float(blocked_feat[2]), 1.0)
+        self.assertGreaterEqual(blocked_info["treasure"]["dist"], 3)
+
     def test_danger_flash_reward_when_it_reduces_pressure(self):
         flash_processor = FlashProcessor()
         flash_processor.last_danger_score = 0.85
@@ -663,6 +693,32 @@ class RecurrentPPOTests(unittest.TestCase):
         self.assertEqual(first_reward["first_seen_treasure_count"], 1)
         self.assertEqual(second_reward["first_seen_treasure_count"], 0)
         self.assertGreater(first_reward["treasure_reward"], second_reward["treasure_reward"])
+
+    def test_treasure_bfs_progress_reward_is_first_difference(self):
+        processor = OrganProcessor()
+        env_info = {"treasures_collected": 0, "collected_buff": 0}
+        hero_pos = {"x": 0, "z": 0}
+        route_far = {
+            "treasure": {"has": 1.0, "dist_norm": 0.30, "key": (1, 1), "memory_key": (1, 12, 0)},
+            "buff": {"has": 0.0},
+        }
+        route_near = {
+            "treasure": {"has": 1.0, "dist_norm": 0.20, "key": (1, 1), "memory_key": (1, 12, 0)},
+            "buff": {"has": 0.0},
+        }
+        route_away = {
+            "treasure": {"has": 1.0, "dist_norm": 0.25, "key": (1, 1), "memory_key": (1, 12, 0)},
+            "buff": {"has": 0.0},
+        }
+
+        first = processor.calc_reward(env_info, [], hero_pos, hero={}, terrain_stats={}, danger_score=0.1, route_info=route_far)
+        near = processor.calc_reward(env_info, [], hero_pos, hero={}, terrain_stats={}, danger_score=0.1, route_info=route_near)
+        away = processor.calc_reward(env_info, [], hero_pos, hero={}, terrain_stats={}, danger_score=0.1, route_info=route_away)
+
+        self.assertEqual(first["treasure_bfs_progress"], 0.0)
+        self.assertGreater(near["treasure_bfs_progress"], 0.0)
+        self.assertGreater(near["treasure_reward"], 0.0)
+        self.assertLess(away["treasure_bfs_progress"], 0.0)
 
     def test_organ_memory_features_keep_seen_uncollected_loot(self):
         processor = OrganProcessor()

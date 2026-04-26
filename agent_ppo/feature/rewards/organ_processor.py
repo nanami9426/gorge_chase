@@ -10,6 +10,9 @@ BUFF_APPROACH_REWARD_SCALE = 0.65
 TREASURE_PICKUP_REWARD = 8.0
 BUFF_PICKUP_REWARD = 3.0
 FIRST_SEEN_TREASURE_REWARD = 0.35
+BFS_PROGRESS_CLIP = 0.20
+TREASURE_BFS_PROGRESS_REWARD_SCALE = 2.20
+BUFF_BFS_PROGRESS_REWARD_SCALE = 1.20
 TREASURE_NEAR_DIST_NORM = 10.0 / MAX_MAP_DISTANCE # 近距离宝箱的阈值，大约是6格以内
 TREASURE_STALL_PENALTY_SCALE = 0.045
 TREASURE_STALL_PENALTY_CAP = 0.45
@@ -53,6 +56,10 @@ class OrganProcessor:
         self.last_treasure_key = None
         self.last_buff_dist_norm = None
         self.last_buff_key = None
+        self.last_treasure_bfs_key = None
+        self.last_treasure_bfs_dist_norm = None
+        self.last_buff_bfs_key = None
+        self.last_buff_bfs_dist_norm = None
         self.last_treasures_collected = None
         self.last_collected_buff = None
         self.treasure_stall_steps = 0
@@ -314,11 +321,32 @@ class OrganProcessor:
             / max(TREASURE_DANGER_DAMP_END - TREASURE_DANGER_DAMP_START, 1e-6)
         )
 
-    def calc_reward(self, env_info, organs, hero_pos, hero=None, terrain_stats=None, danger_score=0.0):
+    def calc_bfs_progress_reward(self, route_target, last_key, last_dist_norm, scale):
+        route_target = route_target or {}
+        if float(route_target.get("has", 0.0)) <= 0.0:
+            return 0.0, None, None
+
+        target_key = route_target.get("memory_key") or route_target.get("key")
+        dist_norm = float(route_target.get("dist_norm", 1.0))
+        if target_key is None:
+            return 0.0, None, None
+
+        reward = 0.0
+        if last_key == target_key and last_dist_norm is not None:
+            progress = float(np.clip(last_dist_norm - dist_norm, -BFS_PROGRESS_CLIP, BFS_PROGRESS_CLIP))
+            reward = float(scale * progress)
+        return reward, target_key, dist_norm
+
+    def calc_reward(self, env_info, organs, hero_pos, hero=None, terrain_stats=None, danger_score=0.0, route_info=None):
         available_organs = self.build_available_organs(organs, hero_pos)
         self.update_memory_from_available(available_organs)
         cached_organs = self.build_cached_organs(hero_pos)
         cached_treasures = [organ for organ in cached_organs if int(organ["sub_type"]) == 1]
+        route_info = route_info or {}
+        treasure_route = route_info.get("treasure", {})
+        buff_route = route_info.get("buff", {})
+        has_treasure_bfs_route = float(treasure_route.get("has", 0.0)) > 0.0
+        has_buff_bfs_route = float(buff_route.get("has", 0.0)) > 0.0
         available_treasure_count = sum(1 for organ in available_organs if int(organ["sub_type"]) == 1)
         available_buff_count = sum(1 for organ in available_organs if int(organ["sub_type"]) == 2)
         nearest_treasure = self.select_nearest_organ(available_organs, sub_type=1)
@@ -369,6 +397,20 @@ class OrganProcessor:
                 self.seen_treasure_keys.add(treasure["memory_key"])
                 first_seen_treasure_count += 1
         treasure_reward += first_seen_treasure_count * FIRST_SEEN_TREASURE_REWARD * treasure_approach_weight
+        treasure_bfs_progress_reward, treasure_bfs_key, treasure_bfs_dist_norm = self.calc_bfs_progress_reward(
+            route_target=treasure_route,
+            last_key=self.last_treasure_bfs_key,
+            last_dist_norm=self.last_treasure_bfs_dist_norm,
+            scale=TREASURE_BFS_PROGRESS_REWARD_SCALE,
+        )
+        buff_bfs_progress_reward, buff_bfs_key, buff_bfs_dist_norm = self.calc_bfs_progress_reward(
+            route_target=buff_route,
+            last_key=self.last_buff_bfs_key,
+            last_dist_norm=self.last_buff_bfs_dist_norm,
+            scale=BUFF_BFS_PROGRESS_REWARD_SCALE,
+        )
+        treasure_reward += treasure_approach_scale * treasure_bfs_progress_reward
+        buff_reward += buff_approach_scale * buff_priority_weight * buff_bfs_progress_reward
 
         target_treasure_key = None if target_treasure is None else target_treasure["key"]
         target_treasure_memory_key = None if target_treasure is None else target_treasure.get("memory_key")
@@ -377,7 +419,7 @@ class OrganProcessor:
             and self.last_treasure_key == target_treasure_key
             and self.last_treasure_dist_norm is not None
         )
-        if target_treasure is not None and same_treasure_target:
+        if not has_treasure_bfs_route and target_treasure is not None and same_treasure_target:
             # 判断这一帧是不是比上一帧更接近当前最高优先级宝箱
             close_ratio = max(
                 0.0,
@@ -402,7 +444,7 @@ class OrganProcessor:
             and self.last_buff_key == target_buff_key
             and self.last_buff_dist_norm is not None
         )
-        if target_buff is not None and same_buff_target:
+        if not has_buff_bfs_route and target_buff is not None and same_buff_target:
             delta_buff_dist = self.last_buff_dist_norm - target_buff["dist_norm"]
             buff_scale = BUFF_APPROACH_REWARD_SCALE * (0.55 if nearest_buff is None else 1.0)
             buff_reward += buff_approach_scale * buff_priority_weight * buff_scale * delta_buff_dist
@@ -464,6 +506,10 @@ class OrganProcessor:
         self.last_treasure_key = target_treasure_key
         self.last_buff_dist_norm = None if target_buff is None else target_buff["dist_norm"]
         self.last_buff_key = target_buff_key
+        self.last_treasure_bfs_key = treasure_bfs_key
+        self.last_treasure_bfs_dist_norm = treasure_bfs_dist_norm
+        self.last_buff_bfs_key = buff_bfs_key
+        self.last_buff_bfs_dist_norm = buff_bfs_dist_norm
         self.last_treasures_collected = treasures_collected
         self.last_collected_buff = collected_buff
         return {
@@ -478,5 +524,7 @@ class OrganProcessor:
             "known_treasure_count": int(len(self.known_treasures)),
             "known_buff_count": int(len(self.known_buffs)),
             "first_seen_treasure_count": int(first_seen_treasure_count),
+            "treasure_bfs_progress": float(treasure_bfs_progress_reward),
+            "buff_bfs_progress": float(buff_bfs_progress_reward),
             "nearest_buff_dist_norm": float(1.0 if target_buff is None else target_buff["dist_norm"]),
         }
